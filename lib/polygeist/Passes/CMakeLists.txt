@@ -18,6 +18,7 @@ add_mlir_dialect_library(MLIRPolygeistTransforms
   InnerSerialization.cpp
   ForBreakToWhile.cpp
   ConvertParallelToGPU.cpp
+  ConvertGPUToVortex.cpp
   SerializeToCubin.cpp
   SerializeToHsaco.cpp
   ParallelLoopUnroll.cpp
@@ -80,7 +81,8 @@ target_compile_definitions(obj.MLIRPolygeistTransforms
   POLYGEIST_PGO_DATA_DIR_ENV_VAR="${POLYGEIST_PGO_DATA_DIR_ENV_VAR}"
 )
 
-if(POLYGEIST_ENABLE_CUDA)
+# Only require CUDA toolkit if full CUDA support (not syntax-only mode)
+if(POLYGEIST_ENABLE_CUDA AND NOT POLYGEIST_CUDA_FRONTEND_ONLY)
   find_package(CUDA)
   enable_language(CUDA)
 

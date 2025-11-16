@@ -300,4 +300,23 @@ def ConvertPolygeistToLLVM : Pass<"convert-polygeist-to-llvm", "mlir::ModuleOp">
   ];
 }
 
+def ConvertGPUToVortex : Pass<"convert-gpu-to-vortex", "ModuleOp"> {
+  let summary = "Lower GPU dialect operations to Vortex RISC-V intrinsics";
+  let description = [{
+    This pass converts GPU dialect operations to LLVM dialect with Vortex-specific
+    intrinsics. It lowers operations like gpu.thread_id, gpu.block_id to RISC-V
+    CSR reads via inline assembly, preparing the code for the Vortex GPGPU backend.
+
+    Example:
+      %tid = gpu.thread_id x
+    becomes:
+      %tid = llvm.inline_asm "csrr $0, 0xCC0" : () -> i32
+  }];
+  let constructor = "mlir::polygeist::createConvertGPUToVortexPass()";
+  let dependentDialects = [
+    "LLVM::LLVMDialect",
+    "gpu::GPUDialect",
+  ];
+}
+
 #endif // POLYGEIST_PASSES

@@ -79,6 +79,8 @@ createGpuSerializeToHsacoPass(StringRef arch, StringRef features,
 void registerGpuSerializeToCubinPass();
 void registerGpuSerializeToHsacoPass();
 
+std::unique_ptr<Pass> createConvertGPUToVortexPass();
+
 void populateForBreakToWhilePatterns(RewritePatternSet &patterns);
 } // namespace polygeist
 } // namespace mlir
