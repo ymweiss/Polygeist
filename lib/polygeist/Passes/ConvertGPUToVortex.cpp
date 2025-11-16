@@ -162,6 +162,131 @@ struct BlockIdOpLowering : public ConvertOpToLLVMPattern<BlockIdOp> {
   }
 };
 
+/// Lower gpu.block_dim to TLS variable access
+/// Accesses the blockDim global variable set by vx_spawn_threads()
+struct BlockDimOpLowering : public ConvertOpToLLVMPattern<gpu::BlockDimOp> {
+  using ConvertOpToLLVMPattern<gpu::BlockDimOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(gpu::BlockDimOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    auto module = op->getParentOfType<ModuleOp>();
+
+    // Get the dimension (X, Y, or Z)
+    auto dimension = op.getDimension();
+
+    // Access blockDim.{x,y,z} from global variable
+    // Note: blockDim is NOT thread-local, it's a regular global
+    auto result = createDim3TLSAccess(module, rewriter, loc,
+                                      "blockDim", dimension);
+
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
+/// Lower gpu.grid_dim to TLS variable access
+/// Accesses the gridDim global variable set by vx_spawn_threads()
+struct GridDimOpLowering : public ConvertOpToLLVMPattern<gpu::GridDimOp> {
+  using ConvertOpToLLVMPattern<gpu::GridDimOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(gpu::GridDimOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    auto module = op->getParentOfType<ModuleOp>();
+
+    // Get the dimension (X, Y, or Z)
+    auto dimension = op.getDimension();
+
+    // Access gridDim.{x,y,z} from global variable
+    // Note: gridDim is NOT thread-local, it's a regular global
+    auto result = createDim3TLSAccess(module, rewriter, loc,
+                                      "gridDim", dimension);
+
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
+/// Lower gpu.barrier to Vortex vx_barrier call
+/// Synchronizes all threads in a block using Vortex hardware barriers
+/// TODO: Complete implementation after testing blockDim/gridDim
+/*
+struct BarrierOpLowering : public ConvertOpToLLVMPattern<gpu::BarrierOp> {
+  using ConvertOpToLLVMPattern<gpu::BarrierOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(gpu::BarrierOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    auto module = op->getParentOfType<ModuleOp>();
+    MLIRContext *context = module.getContext();
+
+    // Allocate barrier ID (simple counter for now)
+    // TODO: Proper barrier ID allocation to avoid conflicts
+    static int barrierIdCounter = 0;
+    int barrierId = barrierIdCounter++;
+
+    // Create barrier ID constant
+    auto i32Type = rewriter.getI32Type();
+    auto barIdConstant = rewriter.create<LLVM::ConstantOp>(
+        loc, i32Type, rewriter.getI32IntegerAttr(barrierId));
+
+    // Get blockDim to calculate total threads
+    // We need blockDim.x * blockDim.y * blockDim.z
+    auto blockDimX = createDim3TLSAccess(module, rewriter, loc,
+                                         "blockDim", gpu::Dimension::x);
+    auto blockDimY = createDim3TLSAccess(module, rewriter, loc,
+                                         "blockDim", gpu::Dimension::y);
+    auto blockDimZ = createDim3TLSAccess(module, rewriter, loc,
+                                         "blockDim", gpu::Dimension::z);
+
+    // Convert index to i32 for multiplication
+    auto castX = rewriter.create<UnrealizedConversionCastOp>(
+        loc, i32Type, blockDimX);
+    auto castY = rewriter.create<UnrealizedConversionCastOp>(
+        loc, i32Type, blockDimY);
+    auto castZ = rewriter.create<UnrealizedConversionCastOp>(
+        loc, i32Type, blockDimZ);
+
+    // Calculate total threads: x * y * z
+    auto tempXY = rewriter.create<LLVM::MulOp>(loc, i32Type,
+                                                castX.getResult(0),
+                                                castY.getResult(0));
+    auto numThreads = rewriter.create<LLVM::MulOp>(loc, i32Type,
+                                                     tempXY,
+                                                     castZ.getResult(0));
+
+    // Declare vx_barrier function if not already declared
+    auto vxBarrierFunc = module.lookupSymbol<LLVM::LLVMFuncOp>("vx_barrier");
+    if (!vxBarrierFunc) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(module.getBody());
+
+      auto funcType = LLVM::LLVMFunctionType::get(
+          LLVM::LLVMVoidType::get(context),
+          {i32Type, i32Type},
+          false);
+
+      vxBarrierFunc = rewriter.create<LLVM::LLVMFuncOp>(
+          module.getLoc(), "vx_barrier", funcType);
+    }
+
+    // Call vx_barrier(bar_id, num_threads)
+    SmallVector<Value> args;
+    args.push_back(barIdConstant.getResult());
+    args.push_back(numThreads.getResult());
+
+    rewriter.replaceOpWithNewOp<LLVM::CallOp>(
+        op, vxBarrierFunc, args);
+
+    return success();
+  }
+};
+*/
+
 //===----------------------------------------------------------------------===//
 // Pass Definition
 //===----------------------------------------------------------------------===//
@@ -191,11 +316,14 @@ struct ConvertGPUToVortexPass
     // Set up conversion target
     LLVMConversionTarget target(*context);
     target.addLegalDialect<LLVM::LLVMDialect>();
-    target.addIllegalOp<ThreadIdOp, BlockIdOp>();
+    target.addIllegalOp<ThreadIdOp, BlockIdOp, gpu::BlockDimOp, gpu::GridDimOp>();
+    // TODO: Add gpu::BarrierOp when BarrierOpLowering is complete
 
     // Set up rewrite patterns
     RewritePatternSet patterns(context);
-    patterns.add<ThreadIdOpLowering, BlockIdOpLowering>(typeConverter);
+    patterns.add<ThreadIdOpLowering, BlockIdOpLowering, BlockDimOpLowering,
+                 GridDimOpLowering>(typeConverter);
+    // TODO: Add BarrierOpLowering when implementation is complete
 
     // Apply the conversion
     if (failed(applyPartialConversion(module, target, std::move(patterns)))) {
