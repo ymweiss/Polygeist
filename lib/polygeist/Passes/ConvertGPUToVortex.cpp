@@ -37,10 +37,87 @@ constexpr uint32_t VX_CSR_NUM_WARPS = 0xFC1;
 constexpr uint32_t VX_CSR_NUM_CORES = 0xFC2;
 
 //===----------------------------------------------------------------------===//
+// Helper Functions
+//===----------------------------------------------------------------------===//
+
+/// Get or create a TLS global variable for dim3_t type (threadIdx/blockIdx)
+/// Returns the address of the TLS variable
+static LLVM::GlobalOp getOrCreateDim3TLSGlobal(ModuleOp module,
+                                               OpBuilder &builder,
+                                               StringRef name) {
+  MLIRContext *context = module.getContext();
+
+  // Check if global already exists
+  if (auto existing = module.lookupSymbol<LLVM::GlobalOp>(name)) {
+    return existing;
+  }
+
+  // Create dim3_t struct type: { i32, i32, i32 }
+  auto i32Type = builder.getI32Type();
+  auto dim3Type = LLVM::LLVMStructType::getLiteral(
+      context, {i32Type, i32Type, i32Type});
+
+  // Create external thread-local global variable
+  OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPointToStart(module.getBody());
+
+  return builder.create<LLVM::GlobalOp>(
+      module.getLoc(),
+      dim3Type,
+      /*isConstant=*/false,
+      LLVM::Linkage::External,
+      name,
+      /*value=*/Attribute(),
+      /*alignment=*/0,
+      /*addrSpace=*/0,
+      /*dsoLocal=*/false,
+      /*threadLocal=*/true);
+}
+
+/// Access a field of a TLS dim3_t variable (threadIdx or blockIdx)
+/// dimension: gpu::Dimension::x (0), y (1), or z (2)
+static Value createDim3TLSAccess(ModuleOp module,
+                                 ConversionPatternRewriter &rewriter,
+                                 Location loc,
+                                 StringRef varName,
+                                 gpu::Dimension dimension) {
+  MLIRContext *context = module.getContext();
+
+  // Get or create the TLS global variable
+  auto globalVar = getOrCreateDim3TLSGlobal(module, rewriter, varName);
+
+  // Get the address of the global
+  auto ptrType = LLVM::LLVMPointerType::get(context);
+  auto globalAddr = rewriter.create<LLVM::AddressOfOp>(
+      loc, ptrType, globalVar.getSymName());
+
+  // Create GEP to access the specific field (x=0, y=1, z=2)
+  auto i32Type = rewriter.getI32Type();
+  auto dim3Type = LLVM::LLVMStructType::getLiteral(
+      context, {i32Type, i32Type, i32Type});
+
+  // GEP indices: [0, dimension]
+  // First 0 is to dereference the pointer
+  // Second index selects the struct field
+  SmallVector<LLVM::GEPArg> indices;
+  indices.push_back(0);  // Base index
+  indices.push_back(static_cast<int32_t>(dimension));  // Field index (0=x, 1=y, 2=z)
+
+  auto gep = rewriter.create<LLVM::GEPOp>(
+      loc, ptrType, dim3Type, globalAddr, indices);
+
+  // Load the value from the computed address
+  auto result = rewriter.create<LLVM::LoadOp>(loc, i32Type, gep);
+
+  return result.getResult();
+}
+
+//===----------------------------------------------------------------------===//
 // Conversion Patterns
 //===----------------------------------------------------------------------===//
 
-/// Lower gpu.thread_id to RISC-V CSR read via inline assembly
+/// Lower gpu.thread_id to TLS variable access
+/// Accesses the threadIdx TLS variable set by vx_spawn_threads()
 struct ThreadIdOpLowering : public ConvertOpToLLVMPattern<ThreadIdOp> {
   using ConvertOpToLLVMPattern<ThreadIdOp>::ConvertOpToLLVMPattern;
 
@@ -48,38 +125,22 @@ struct ThreadIdOpLowering : public ConvertOpToLLVMPattern<ThreadIdOp> {
   matchAndRewrite(ThreadIdOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
+    auto module = op->getParentOfType<ModuleOp>();
 
-    // For now, all dimensions map to thread ID within warp
-    // TODO: Proper 3D thread ID calculation from spawn framework
-    uint32_t csrAddr = VX_CSR_THREAD_ID;
+    // Get the dimension (X, Y, or Z)
+    auto dimension = op.getDimension();
 
-    // Create RISC-V inline assembly: csrr $0, <csr_addr>
-    // This reads a Control Status Register and returns the value
-    std::string asmStr = "csrr $0, " + std::to_string(csrAddr);
+    // Access threadIdx.{x,y,z} from TLS
+    auto result = createDim3TLSAccess(module, rewriter, loc,
+                                      "threadIdx", dimension);
 
-    // Create the inline assembly operation
-    // Inputs: none
-    // Outputs: one i32 value
-    // Constraints: "$0" means first output register
-    auto asmOp = rewriter.create<LLVM::InlineAsmOp>(
-        loc,
-        /*resultTypes=*/rewriter.getI32Type(),
-        /*operands=*/ValueRange{},
-        /*asm_string=*/asmStr,
-        /*constraints=*/"=r",  // Output: any register
-        /*has_side_effects=*/false,
-        /*is_align_stack=*/false,
-        /*asm_dialect=*/LLVM::AsmDialectAttr{},
-        /*operand_attrs=*/ArrayAttr{});
-
-    rewriter.replaceOp(op, asmOp.getRes());
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
 
-/// Lower gpu.block_id to threadIdx from TLS (Thread Local Storage)
-/// In Vortex spawn framework, blockIdx is a __thread variable
-/// For now, we use CSR as placeholder - proper TLS access needs more work
+/// Lower gpu.block_id to TLS variable access
+/// Accesses the blockIdx TLS variable set by vx_spawn_threads()
 struct BlockIdOpLowering : public ConvertOpToLLVMPattern<BlockIdOp> {
   using ConvertOpToLLVMPattern<BlockIdOp>::ConvertOpToLLVMPattern;
 
@@ -87,24 +148,16 @@ struct BlockIdOpLowering : public ConvertOpToLLVMPattern<BlockIdOp> {
   matchAndRewrite(BlockIdOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
+    auto module = op->getParentOfType<ModuleOp>();
 
-    // Placeholder: use warp ID as block ID for now
-    // TODO: Access blockIdx TLS variable from vx_spawn framework
-    uint32_t csrAddr = VX_CSR_WARP_ID;
+    // Get the dimension (X, Y, or Z)
+    auto dimension = op.getDimension();
 
-    std::string asmStr = "csrr $0, " + std::to_string(csrAddr);
+    // Access blockIdx.{x,y,z} from TLS
+    auto result = createDim3TLSAccess(module, rewriter, loc,
+                                      "blockIdx", dimension);
 
-    auto asmOp = rewriter.create<LLVM::InlineAsmOp>(
-        loc,
-        rewriter.getI32Type(),
-        ValueRange{},
-        asmStr,
-        "=r",
-        false, false,
-        LLVM::AsmDialectAttr{},
-        ArrayAttr{});
-
-    rewriter.replaceOp(op, asmOp.getRes());
+    rewriter.replaceOp(op, result);
     return success();
   }
 };
