@@ -31,10 +31,18 @@ add_clang_executable(cgeist
   Lib/TypeUtils.cc
   Lib/CGCall.cc 
 )
-if(POLYGEIST_ENABLE_CUDA)
+if(POLYGEIST_ENABLE_CUDA OR POLYGEIST_CUDA_FRONTEND_ONLY)
   target_compile_definitions(cgeist
     PRIVATE
     POLYGEIST_ENABLE_CUDA=1
+  )
+endif()
+
+# Define POLYGEIST_CUDA_FULL only if full CUDA support (execution engine available)
+if(POLYGEIST_ENABLE_CUDA AND NOT POLYGEIST_CUDA_FRONTEND_ONLY)
+  target_compile_definitions(cgeist
+    PRIVATE
+    POLYGEIST_CUDA_FULL=1
   )
   add_dependencies(cgeist execution_engine_cuda_wrapper_binary_include)
 endif()

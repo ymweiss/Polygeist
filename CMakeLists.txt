@@ -3,7 +3,14 @@ cmake_minimum_required(VERSION 3.13.4)
 include(CheckCXXSourceCompiles)
 
 set(POLYGEIST_ENABLE_CUDA 0 CACHE BOOL "Enable CUDA frontend and backend")
+set(POLYGEIST_ENABLE_CUDA_SYNTAX_ONLY 0 CACHE BOOL "Enable CUDA syntax parsing without requiring CUDA toolkit")
 set(POLYGEIST_ENABLE_ROCM 0 CACHE BOOL "Enable ROCM backend")
+
+# If CUDA_SYNTAX_ONLY is enabled, set flag for frontend-only mode
+if(POLYGEIST_ENABLE_CUDA_SYNTAX_ONLY)
+  set(POLYGEIST_CUDA_FRONTEND_ONLY 1)
+  message(STATUS "CUDA syntax-only mode enabled (no CUDA toolkit required)")
+endif()
 
 set(POLYGEIST_ENABLE_POLYMER 0 CACHE BOOL "Enable Polymer")
 set(POLYGEIST_POLYMER_ENABLE_ISL 0 CACHE BOOL "Enable Polymer isl")

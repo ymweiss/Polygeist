@@ -1025,7 +1025,7 @@ int main(int argc, char **argv) {
           CudaInstallationDetector detector(*driver, triple, argList);
 
           if (EmitCUDA) {
-#if POLYGEIST_ENABLE_CUDA
+#if POLYGEIST_CUDA_FULL
             std::string arch = CUDAGPUArch;
             if (arch == "")
               arch = "sm_60";
@@ -1104,7 +1104,7 @@ int main(int argc, char **argv) {
       llvm::errs() << "Failed to emit LLVM IR\n";
       return -1;
     }
-#if POLYGEIST_ENABLE_CUDA
+#if POLYGEIST_CUDA_FULL
     if (EmitCUDA) {
 // This header defines:
 // unsigned char CudaRuntimeWrappers_cpp_bc[]

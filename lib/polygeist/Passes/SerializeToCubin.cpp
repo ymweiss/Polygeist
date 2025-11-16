@@ -412,5 +412,11 @@ std::unique_ptr<Pass> createGpuSerializeToCubinPass(
 #else
 namespace mlir::polygeist {
 void registerGpuSerializeToCubinPass() {}
+std::unique_ptr<Pass> createGpuSerializeToCubinPass(
+    StringRef arch, StringRef features, int llvmOptLevel, int ptxasOptLevel,
+    std::string ptxasPath, std::string libDevicePath, bool outputIntermediate) {
+  llvm::errs() << "error: CUDA toolkit support not enabled in this build\n";
+  return nullptr;
+}
 } // namespace mlir::polygeist
 #endif

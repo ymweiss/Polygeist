@@ -1,5 +1,11 @@
 # TODO we do not support cross compilation currently
 
+# Skip execution engine entirely if syntax-only mode
+if(POLYGEIST_CUDA_FRONTEND_ONLY)
+  message(STATUS "Skipping CUDA execution engine (syntax-only mode)")
+  return()
+endif()
+
 if(POLYGEIST_ENABLE_CUDA)
   find_package(CUDA)
   enable_language(CUDA)
