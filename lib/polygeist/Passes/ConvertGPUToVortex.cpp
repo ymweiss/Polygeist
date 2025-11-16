@@ -212,8 +212,6 @@ struct GridDimOpLowering : public ConvertOpToLLVMPattern<gpu::GridDimOp> {
 
 /// Lower gpu.barrier to Vortex vx_barrier call
 /// Synchronizes all threads in a block using Vortex hardware barriers
-/// TODO: Complete implementation after testing blockDim/gridDim
-/*
 struct BarrierOpLowering : public ConvertOpToLLVMPattern<gpu::BarrierOp> {
   using ConvertOpToLLVMPattern<gpu::BarrierOp>::ConvertOpToLLVMPattern;
 
@@ -243,21 +241,12 @@ struct BarrierOpLowering : public ConvertOpToLLVMPattern<gpu::BarrierOp> {
     auto blockDimZ = createDim3TLSAccess(module, rewriter, loc,
                                          "blockDim", gpu::Dimension::z);
 
-    // Convert index to i32 for multiplication
-    auto castX = rewriter.create<UnrealizedConversionCastOp>(
-        loc, i32Type, blockDimX);
-    auto castY = rewriter.create<UnrealizedConversionCastOp>(
-        loc, i32Type, blockDimY);
-    auto castZ = rewriter.create<UnrealizedConversionCastOp>(
-        loc, i32Type, blockDimZ);
-
     // Calculate total threads: x * y * z
+    // blockDimX/Y/Z are already i32 from TLS load
     auto tempXY = rewriter.create<LLVM::MulOp>(loc, i32Type,
-                                                castX.getResult(0),
-                                                castY.getResult(0));
+                                                blockDimX, blockDimY);
     auto numThreads = rewriter.create<LLVM::MulOp>(loc, i32Type,
-                                                     tempXY,
-                                                     castZ.getResult(0));
+                                                     tempXY, blockDimZ);
 
     // Declare vx_barrier function if not already declared
     auto vxBarrierFunc = module.lookupSymbol<LLVM::LLVMFuncOp>("vx_barrier");
@@ -268,7 +257,7 @@ struct BarrierOpLowering : public ConvertOpToLLVMPattern<gpu::BarrierOp> {
       auto funcType = LLVM::LLVMFunctionType::get(
           LLVM::LLVMVoidType::get(context),
           {i32Type, i32Type},
-          false);
+          /*isVarArg=*/false);
 
       vxBarrierFunc = rewriter.create<LLVM::LLVMFuncOp>(
           module.getLoc(), "vx_barrier", funcType);
@@ -285,7 +274,6 @@ struct BarrierOpLowering : public ConvertOpToLLVMPattern<gpu::BarrierOp> {
     return success();
   }
 };
-*/
 
 //===----------------------------------------------------------------------===//
 // Pass Definition
@@ -316,14 +304,13 @@ struct ConvertGPUToVortexPass
     // Set up conversion target
     LLVMConversionTarget target(*context);
     target.addLegalDialect<LLVM::LLVMDialect>();
-    target.addIllegalOp<ThreadIdOp, BlockIdOp, gpu::BlockDimOp, gpu::GridDimOp>();
-    // TODO: Add gpu::BarrierOp when BarrierOpLowering is complete
+    target.addIllegalOp<ThreadIdOp, BlockIdOp, gpu::BlockDimOp, gpu::GridDimOp,
+                        gpu::BarrierOp>();
 
     // Set up rewrite patterns
     RewritePatternSet patterns(context);
     patterns.add<ThreadIdOpLowering, BlockIdOpLowering, BlockDimOpLowering,
-                 GridDimOpLowering>(typeConverter);
-    // TODO: Add BarrierOpLowering when implementation is complete
+                 GridDimOpLowering, BarrierOpLowering>(typeConverter);
 
     // Apply the conversion
     if (failed(applyPartialConversion(module, target, std::move(patterns)))) {

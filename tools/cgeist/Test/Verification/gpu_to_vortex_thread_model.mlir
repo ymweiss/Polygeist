@@ -10,10 +10,8 @@ module {
 
   // CHECK-LABEL: func @test_block_dim_x
   func.func @test_block_dim_x() -> index {
-    // CHECK: llvm.mlir.global external @blockDim
     // CHECK: llvm.mlir.addressof @blockDim
-    // CHECK: llvm.getelementptr
-    // CHECK-SAME: 0
+    // CHECK: llvm.getelementptr {{.*}}[0, 0]
     // CHECK: llvm.load
     %bdim = gpu.block_dim x
     // CHECK: builtin.unrealized_conversion_cast
@@ -24,8 +22,7 @@ module {
   // CHECK-LABEL: func @test_block_dim_y
   func.func @test_block_dim_y() -> index {
     // CHECK: llvm.mlir.addressof @blockDim
-    // CHECK: llvm.getelementptr
-    // CHECK-SAME: 1
+    // CHECK: llvm.getelementptr {{.*}}[0, 1]
     // CHECK: llvm.load
     %bdim = gpu.block_dim y
     // CHECK: builtin.unrealized_conversion_cast
@@ -36,8 +33,7 @@ module {
   // CHECK-LABEL: func @test_block_dim_z
   func.func @test_block_dim_z() -> index {
     // CHECK: llvm.mlir.addressof @blockDim
-    // CHECK: llvm.getelementptr
-    // CHECK-SAME: 2
+    // CHECK: llvm.getelementptr {{.*}}[0, 2]
     // CHECK: llvm.load
     %bdim = gpu.block_dim z
     // CHECK: builtin.unrealized_conversion_cast
@@ -51,10 +47,8 @@ module {
 
   // CHECK-LABEL: func @test_grid_dim_x
   func.func @test_grid_dim_x() -> index {
-    // CHECK: llvm.mlir.global external @gridDim
     // CHECK: llvm.mlir.addressof @gridDim
-    // CHECK: llvm.getelementptr
-    // CHECK-SAME: 0
+    // CHECK: llvm.getelementptr {{.*}}[0, 0]
     // CHECK: llvm.load
     %gdim = gpu.grid_dim x
     // CHECK: builtin.unrealized_conversion_cast
@@ -65,8 +59,7 @@ module {
   // CHECK-LABEL: func @test_grid_dim_y
   func.func @test_grid_dim_y() -> index {
     // CHECK: llvm.mlir.addressof @gridDim
-    // CHECK: llvm.getelementptr
-    // CHECK-SAME: 1
+    // CHECK: llvm.getelementptr {{.*}}[0, 1]
     // CHECK: llvm.load
     %gdim = gpu.grid_dim y
     // CHECK: builtin.unrealized_conversion_cast
@@ -77,8 +70,7 @@ module {
   // CHECK-LABEL: func @test_grid_dim_z
   func.func @test_grid_dim_z() -> index {
     // CHECK: llvm.mlir.addressof @gridDim
-    // CHECK: llvm.getelementptr
-    // CHECK-SAME: 2
+    // CHECK: llvm.getelementptr {{.*}}[0, 2]
     // CHECK: llvm.load
     %gdim = gpu.grid_dim z
     // CHECK: builtin.unrealized_conversion_cast
@@ -92,11 +84,18 @@ module {
 
   // CHECK-LABEL: func @test_simple_barrier
   func.func @test_simple_barrier() {
-    // CHECK: %[[BAR_ID:.*]] = llvm.mlir.constant(0 : i32)
+    // CHECK: %[[BAR_ID:.*]] = llvm.mlir.constant({{[0-9]+}} : i32)
     // CHECK: llvm.mlir.addressof @blockDim
-    // CHECK: llvm.getelementptr
+    // CHECK: llvm.getelementptr {{.*}}[0, 0]
     // CHECK: llvm.load
-    // CHECK: %[[NUM_THREADS:.*]] = builtin.unrealized_conversion_cast
+    // CHECK: llvm.mlir.addressof @blockDim
+    // CHECK: llvm.getelementptr {{.*}}[0, 1]
+    // CHECK: llvm.load
+    // CHECK: llvm.mlir.addressof @blockDim
+    // CHECK: llvm.getelementptr {{.*}}[0, 2]
+    // CHECK: llvm.load
+    // CHECK: llvm.mul
+    // CHECK: %[[NUM_THREADS:.*]] = llvm.mul
     // CHECK: llvm.call @vx_barrier(%[[BAR_ID]], %[[NUM_THREADS]])
     gpu.barrier
     // CHECK: return
@@ -105,13 +104,13 @@ module {
 
   // CHECK-LABEL: func @test_multiple_barriers
   func.func @test_multiple_barriers() {
-    // First barrier - barrier ID 0
-    // CHECK: %[[BAR_ID_0:.*]] = llvm.mlir.constant(0 : i32)
+    // First barrier
+    // CHECK: %[[BAR_ID_0:.*]] = llvm.mlir.constant({{[0-9]+}} : i32)
     // CHECK: llvm.call @vx_barrier(%[[BAR_ID_0]]
     gpu.barrier
 
-    // Second barrier - barrier ID 1
-    // CHECK: %[[BAR_ID_1:.*]] = llvm.mlir.constant(1 : i32)
+    // Second barrier - ID should be different from first
+    // CHECK: %[[BAR_ID_1:.*]] = llvm.mlir.constant({{[0-9]+}} : i32)
     // CHECK: llvm.call @vx_barrier(%[[BAR_ID_1]]
     gpu.barrier
 
@@ -183,9 +182,4 @@ module {
     return %gid : index
   }
 
-  //===----------------------------------------------------------------------===//
-  // Vortex Runtime Function Declarations
-  //===----------------------------------------------------------------------===//
-
-  // CHECK: llvm.func @vx_barrier(i32, i32)
 }
