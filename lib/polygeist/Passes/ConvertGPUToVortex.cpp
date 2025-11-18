@@ -134,56 +134,59 @@ static void removeDuplicateKernels(ModuleOp module) {
 // Helper Functions
 //===----------------------------------------------------------------------===//
 
-/// Get or create a TLS global variable for dim3_t type (threadIdx/blockIdx)
-/// Returns the address of the TLS variable
-static LLVM::GlobalOp getOrCreateDim3TLSGlobal(ModuleOp module,
-                                               OpBuilder &builder,
-                                               StringRef name) {
-  MLIRContext *context = module.getContext();
+/// Declare an external function to access TLS dim3_t variables
+/// For thread-local variables like blockIdx/threadIdx, we generate helper
+/// functions that return pointers to the TLS variables
+/// Returns an LLVM function declaration
+/// The function is declared within the gpu.module where it's being used
+static LLVM::LLVMFuncOp getOrCreateDim3TLSAccessor(Operation *op,
+                                                    OpBuilder &builder,
+                                                    StringRef varName) {
+  // Find the gpu.module containing this operation
+  auto gpuModule = op->getParentOfType<gpu::GPUModuleOp>();
+  MLIRContext *context = gpuModule.getContext();
 
-  // Check if global already exists
-  if (auto existing = module.lookupSymbol<LLVM::GlobalOp>(name)) {
+  // Create function name: e.g., "vx_get_blockIdx"
+  std::string funcName = ("vx_get_" + varName).str();
+
+  // Check if function already exists in gpu.module
+  if (auto existing = gpuModule.lookupSymbol<LLVM::LLVMFuncOp>(funcName)) {
     return existing;
   }
 
-  // Create dim3_t struct type: { i32, i32, i32 }
-  auto i32Type = builder.getI32Type();
-  auto dim3Type = LLVM::LLVMStructType::getLiteral(
-      context, {i32Type, i32Type, i32Type});
+  // Create function type: () -> !llvm.ptr (returns pointer to dim3_t)
+  auto ptrType = LLVM::LLVMPointerType::get(context);
+  auto funcType = LLVM::LLVMFunctionType::get(ptrType, {}, /*isVarArg=*/false);
 
-  // Create external thread-local global variable
+  // Declare external function within gpu.module
   OpBuilder::InsertionGuard guard(builder);
-  builder.setInsertionPointToStart(module.getBody());
+  builder.setInsertionPointToStart(gpuModule.getBody());
 
-  return builder.create<LLVM::GlobalOp>(
-      module.getLoc(),
-      dim3Type,
-      /*isConstant=*/false,
-      LLVM::Linkage::External,
-      name,
-      /*value=*/Attribute(),
-      /*alignment=*/0,
-      /*addrSpace=*/0,
-      /*dsoLocal=*/false,
-      /*threadLocal=*/true);
+  return builder.create<LLVM::LLVMFuncOp>(
+      gpuModule.getLoc(),
+      funcName,
+      funcType,
+      LLVM::Linkage::External);
 }
 
 /// Access a field of a TLS dim3_t variable (threadIdx or blockIdx)
 /// dimension: gpu::Dimension::x (0), y (1), or z (2)
-static Value createDim3TLSAccess(ModuleOp module,
+static Value createDim3TLSAccess(Operation *op,
                                  ConversionPatternRewriter &rewriter,
                                  Location loc,
                                  StringRef varName,
                                  gpu::Dimension dimension) {
+  auto module = op->getParentOfType<ModuleOp>();
   MLIRContext *context = module.getContext();
 
-  // Get or create the TLS global variable
-  auto globalVar = getOrCreateDim3TLSGlobal(module, rewriter, varName);
+  // Get or create the TLS accessor function
+  auto accessorFunc = getOrCreateDim3TLSAccessor(op, rewriter, varName);
 
-  // Get the address of the global
+  // Call the accessor function to get pointer to TLS variable
   auto ptrType = LLVM::LLVMPointerType::get(context);
-  auto globalAddr = rewriter.create<LLVM::AddressOfOp>(
-      loc, ptrType, globalVar.getSymName());
+  auto callResult = rewriter.create<LLVM::CallOp>(
+      loc, accessorFunc, ValueRange{});
+  Value dim3Ptr = callResult.getResult();
 
   // Create GEP to access the specific field (x=0, y=1, z=2)
   auto i32Type = rewriter.getI32Type();
@@ -198,7 +201,7 @@ static Value createDim3TLSAccess(ModuleOp module,
   indices.push_back(static_cast<int32_t>(dimension));  // Field index (0=x, 1=y, 2=z)
 
   auto gep = rewriter.create<LLVM::GEPOp>(
-      loc, ptrType, dim3Type, globalAddr, indices);
+      loc, ptrType, dim3Type, dim3Ptr, indices);
 
   // Load the value from the computed address
   auto result = rewriter.create<LLVM::LoadOp>(loc, i32Type, gep);
@@ -219,13 +222,12 @@ struct ThreadIdOpLowering : public ConvertOpToLLVMPattern<ThreadIdOp> {
   matchAndRewrite(ThreadIdOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
-    auto module = op->getParentOfType<ModuleOp>();
 
     // Get the dimension (X, Y, or Z)
     auto dimension = op.getDimension();
 
     // Access threadIdx.{x,y,z} from TLS
-    auto result = createDim3TLSAccess(module, rewriter, loc,
+    auto result = createDim3TLSAccess(op, rewriter, loc,
                                       "threadIdx", dimension);
 
     rewriter.replaceOp(op, result);
@@ -242,13 +244,12 @@ struct BlockIdOpLowering : public ConvertOpToLLVMPattern<BlockIdOp> {
   matchAndRewrite(BlockIdOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
-    auto module = op->getParentOfType<ModuleOp>();
 
     // Get the dimension (X, Y, or Z)
     auto dimension = op.getDimension();
 
     // Access blockIdx.{x,y,z} from TLS
-    auto result = createDim3TLSAccess(module, rewriter, loc,
+    auto result = createDim3TLSAccess(op, rewriter, loc,
                                       "blockIdx", dimension);
 
     rewriter.replaceOp(op, result);
@@ -265,14 +266,13 @@ struct BlockDimOpLowering : public ConvertOpToLLVMPattern<gpu::BlockDimOp> {
   matchAndRewrite(gpu::BlockDimOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
-    auto module = op->getParentOfType<ModuleOp>();
 
     // Get the dimension (X, Y, or Z)
     auto dimension = op.getDimension();
 
     // Access blockDim.{x,y,z} from global variable
     // Note: blockDim is NOT thread-local, it's a regular global
-    auto result = createDim3TLSAccess(module, rewriter, loc,
+    auto result = createDim3TLSAccess(op, rewriter, loc,
                                       "blockDim", dimension);
 
     rewriter.replaceOp(op, result);
@@ -289,14 +289,13 @@ struct GridDimOpLowering : public ConvertOpToLLVMPattern<gpu::GridDimOp> {
   matchAndRewrite(gpu::GridDimOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
-    auto module = op->getParentOfType<ModuleOp>();
 
     // Get the dimension (X, Y, or Z)
     auto dimension = op.getDimension();
 
     // Access gridDim.{x,y,z} from global variable
     // Note: gridDim is NOT thread-local, it's a regular global
-    auto result = createDim3TLSAccess(module, rewriter, loc,
+    auto result = createDim3TLSAccess(op, rewriter, loc,
                                       "gridDim", dimension);
 
     rewriter.replaceOp(op, result);
@@ -328,11 +327,11 @@ struct BarrierOpLowering : public ConvertOpToLLVMPattern<gpu::BarrierOp> {
 
     // Get blockDim to calculate total threads
     // We need blockDim.x * blockDim.y * blockDim.z
-    auto blockDimX = createDim3TLSAccess(module, rewriter, loc,
+    auto blockDimX = createDim3TLSAccess(op, rewriter, loc,
                                          "blockDim", gpu::Dimension::x);
-    auto blockDimY = createDim3TLSAccess(module, rewriter, loc,
+    auto blockDimY = createDim3TLSAccess(op, rewriter, loc,
                                          "blockDim", gpu::Dimension::y);
-    auto blockDimZ = createDim3TLSAccess(module, rewriter, loc,
+    auto blockDimZ = createDim3TLSAccess(op, rewriter, loc,
                                          "blockDim", gpu::Dimension::z);
 
     // Calculate total threads: x * y * z
@@ -401,8 +400,11 @@ struct ConvertGPUToVortexPass
     LLVMTypeConverter typeConverter(context);
 
     // Set up conversion target
-    LLVMConversionTarget target(*context);
-    target.addLegalDialect<LLVM::LLVMDialect>();
+    // Mark only the Vortex-specific GPU operations as illegal
+    // All other operations (including GPU structural ops) remain legal
+    // A subsequent --gpu-to-llvm pass will handle gpu.module/gpu.func conversion
+    ConversionTarget target(*context);
+    target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
     target.addIllegalOp<ThreadIdOp, BlockIdOp, gpu::BlockDimOp, gpu::GridDimOp,
                         gpu::BarrierOp>();
 
