@@ -19,6 +19,7 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "polygeist/Passes/Passes.h"
+#include "llvm/ADT/StringMap.h"
 
 using namespace mlir;
 using namespace mlir::gpu;
@@ -35,6 +36,99 @@ constexpr uint32_t VX_CSR_CORE_ID = 0xCC2;
 constexpr uint32_t VX_CSR_NUM_THREADS = 0xFC0;
 constexpr uint32_t VX_CSR_NUM_WARPS = 0xFC1;
 constexpr uint32_t VX_CSR_NUM_CORES = 0xFC2;
+
+//===----------------------------------------------------------------------===//
+// Preprocessing: Consolidate Polygeist Alternatives
+//===----------------------------------------------------------------------===//
+
+/// Extract base kernel name by removing Polygeist variant suffix
+/// Example: _Z12launch_basicPiS_ji_kernel94565344022848 -> _Z12launch_basicPiS_ji
+static StringRef extractBaseKernelName(StringRef mangledName) {
+  size_t pos = mangledName.find("_kernel");
+  if (pos != StringRef::npos) {
+    // Find where the numeric suffix starts after "_kernel"
+    size_t suffixStart = pos + 7; // Length of "_kernel"
+    if (suffixStart < mangledName.size() &&
+        std::isdigit(mangledName[suffixStart])) {
+      return mangledName.substr(0, pos);
+    }
+  }
+  return mangledName;
+}
+
+/// Consolidate polygeist.alternatives to first variant only
+/// This preprocessing step simplifies downstream processing by:
+/// 1. Replacing polygeist.alternatives with content of first alternative
+/// 2. Ensuring single canonical launch configuration for Vortex
+static void consolidatePolygeistAlternatives(ModuleOp module) {
+  SmallVector<Operation *> altOps;
+
+  // Collect all polygeist.alternatives operations
+  module.walk([&](Operation *op) {
+    if (op->getName().getStringRef() == "polygeist.alternatives") {
+      altOps.push_back(op);
+    }
+  });
+
+  // Replace each alternatives op with content of its first region
+  for (Operation *altOp : altOps) {
+    if (altOp->getNumRegions() == 0 || altOp->getRegion(0).empty())
+      continue;
+
+    OpBuilder builder(altOp);
+    Region &firstRegion = altOp->getRegion(0);
+    Block &firstBlock = firstRegion.front();
+
+    // Move all operations from first region to parent block (before alternatives op)
+    // This inlines the first alternative's content
+    auto &ops = firstBlock.getOperations();
+    for (Operation &innerOp : llvm::make_early_inc_range(ops)) {
+      // Skip the terminator (polygeist.polygeist_yield)
+      if (innerOp.getName().getStringRef() == "polygeist.polygeist_yield")
+        continue;
+      innerOp.moveBefore(altOp);
+    }
+
+    // Erase the now-empty alternatives operation
+    altOp->erase();
+  }
+}
+
+/// Remove duplicate GPU kernel functions, keeping only the first variant
+/// After Polygeist auto-tuning, multiple kernel variants exist but only
+/// the first one is referenced after consolidating alternatives.
+static void removeDuplicateKernels(ModuleOp module) {
+  // Track seen kernel base names
+  llvm::StringMap<gpu::GPUFuncOp> seenKernels;
+  SmallVector<gpu::GPUFuncOp> toErase;
+
+  // Walk all GPU modules
+  module.walk([&](gpu::GPUModuleOp gpuModule) {
+    // Collect all kernel functions
+    for (auto gpuFunc : gpuModule.getOps<gpu::GPUFuncOp>()) {
+      if (!gpuFunc.isKernel())
+        continue;
+
+      StringRef funcName = gpuFunc.getName();
+      StringRef baseName = extractBaseKernelName(funcName);
+
+      // Check if we've seen this kernel base name before
+      auto it = seenKernels.find(baseName);
+      if (it != seenKernels.end()) {
+        // Duplicate found - mark for deletion
+        toErase.push_back(gpuFunc);
+      } else {
+        // First occurrence - keep it
+        seenKernels[baseName] = gpuFunc;
+      }
+    }
+  });
+
+  // Erase duplicate kernels
+  for (auto func : toErase) {
+    func.erase();
+  }
+}
 
 //===----------------------------------------------------------------------===//
 // Helper Functions
@@ -297,6 +391,11 @@ struct ConvertGPUToVortexPass
   void runOnOperation() override {
     MLIRContext *context = &getContext();
     ModuleOp module = getOperation();
+
+    // PREPROCESSING: Consolidate Polygeist auto-tuning artifacts
+    // This must happen before any conversion patterns are applied
+    consolidatePolygeistAlternatives(module);
+    removeDuplicateKernels(module);
 
     // Set up type converter for GPU to LLVM types
     LLVMTypeConverter typeConverter(context);
