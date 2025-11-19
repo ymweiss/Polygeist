@@ -368,6 +368,57 @@ struct BarrierOpLowering : public ConvertOpToLLVMPattern<gpu::BarrierOp> {
   }
 };
 
+/// Extract metadata from gpu.launch_func for Vortex kernel argument struct
+/// For RV32, all arguments are 4 bytes (scalars and pointers)
+struct LaunchFuncMetadataExtraction : public OpRewritePattern<gpu::LaunchFuncOp> {
+  using OpRewritePattern<gpu::LaunchFuncOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(gpu::LaunchFuncOp launchOp,
+                                 PatternRewriter &rewriter) const override {
+    // Skip if metadata already exists (avoid infinite loop in greedy rewriter)
+    if (launchOp->hasAttr("vortex.kernel_metadata"))
+      return failure();
+
+    Location loc = launchOp.getLoc();
+
+    // Get kernel name
+    StringRef kernelName = launchOp.getKernelName().getValue();
+
+    // Get kernel arguments
+    auto kernelOperands = launchOp.getKernelOperands();
+    unsigned numArgs = kernelOperands.size();
+
+    // For RV32: all arguments are 4 bytes (scalars and pointers)
+    // Calculate total struct size: numArgs * 4
+    unsigned totalSize = numArgs * 4;
+
+    // Build metadata string for debugging/documentation
+    std::string metadataStr = "Kernel: " + kernelName.str() +
+                              "\nNum args: " + std::to_string(numArgs) +
+                              "\nTotal size (RV32): " + std::to_string(totalSize) + " bytes\nArguments:\n";
+
+    unsigned offset = 0;
+    for (auto [idx, arg] : llvm::enumerate(kernelOperands)) {
+      Type argType = arg.getType();
+      bool isPointer = argType.isa<MemRefType>();
+
+      metadataStr += "  [" + std::to_string(idx) + "] offset=" + std::to_string(offset) +
+                     ", size=4, type=" + (isPointer ? "pointer" : "scalar") + "\n";
+      offset += 4;
+    }
+
+    // Emit metadata as a comment for now (can be enhanced to create LLVM metadata)
+    rewriter.startRootUpdate(launchOp);
+    launchOp->setAttr("vortex.kernel_metadata",
+                      rewriter.getStringAttr(metadataStr));
+    rewriter.finalizeRootUpdate(launchOp);
+
+    // Note: We don't replace the op, just annotate it with metadata
+    // The actual launch lowering will be handled separately
+    return success();
+  }
+};
+
 //===----------------------------------------------------------------------===//
 // Pass Definition
 //===----------------------------------------------------------------------===//
@@ -415,6 +466,13 @@ struct ConvertGPUToVortexPass
 
     // Apply the conversion
     if (failed(applyPartialConversion(module, target, std::move(patterns)))) {
+      signalPassFailure();
+    }
+
+    // Apply metadata extraction as a separate greedy rewrite
+    RewritePatternSet metadataPatterns(context);
+    metadataPatterns.add<LaunchFuncMetadataExtraction>(context);
+    if (failed(applyPatternsAndFoldGreedily(module, std::move(metadataPatterns)))) {
       signalPassFailure();
     }
   }
