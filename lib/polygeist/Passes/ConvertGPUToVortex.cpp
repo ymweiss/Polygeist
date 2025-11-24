@@ -368,6 +368,78 @@ struct BarrierOpLowering : public ConvertOpToLLVMPattern<gpu::BarrierOp> {
   }
 };
 
+/// Lower printf calls to vx_printf with core ID as first argument
+/// Matches: llvm.call @printf(format, args...)
+/// Replaces with: llvm.call @vx_printf(format, cid, args...)
+/// where cid = vx_core_id()
+struct PrintfOpLowering : public OpRewritePattern<LLVM::CallOp> {
+  using OpRewritePattern<LLVM::CallOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(LLVM::CallOp callOp,
+                                 PatternRewriter &rewriter) const override {
+    // Only match calls to 'printf'
+    auto callee = callOp.getCalleeAttr();
+    if (!callee)
+      return failure();
+
+    auto flatSymbolRef = callee.dyn_cast<FlatSymbolRefAttr>();
+    if (!flatSymbolRef || flatSymbolRef.getValue() != "printf")
+      return failure();
+
+    // Only lower printf calls inside GPU modules
+    auto gpuModule = callOp->getParentOfType<gpu::GPUModuleOp>();
+    if (!gpuModule)
+      return failure();
+
+    Location loc = callOp.getLoc();
+    MLIRContext *context = gpuModule.getContext();
+    auto i32Type = rewriter.getI32Type();
+
+    // Declare vx_core_id function in gpu.module if not already declared
+    auto vxCoreIdFunc = gpuModule.lookupSymbol<LLVM::LLVMFuncOp>("vx_core_id");
+    if (!vxCoreIdFunc) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(gpuModule.getBody());
+
+      auto funcType = LLVM::LLVMFunctionType::get(i32Type, {}, /*isVarArg=*/false);
+      vxCoreIdFunc = rewriter.create<LLVM::LLVMFuncOp>(
+          gpuModule.getLoc(), "vx_core_id", funcType);
+    }
+
+    // Declare vx_printf function in gpu.module if not already declared
+    auto vxPrintfFunc = gpuModule.lookupSymbol<LLVM::LLVMFuncOp>("vx_printf");
+    if (!vxPrintfFunc) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(gpuModule.getBody());
+
+      auto ptrType = LLVM::LLVMPointerType::get(context);
+      auto funcType = LLVM::LLVMFunctionType::get(i32Type, {ptrType}, /*isVarArg=*/true);
+      vxPrintfFunc = rewriter.create<LLVM::LLVMFuncOp>(
+          gpuModule.getLoc(), "vx_printf", funcType);
+    }
+
+    // Call vx_core_id() to get core ID
+    auto coreIdCall = rewriter.create<LLVM::CallOp>(loc, vxCoreIdFunc, ValueRange{});
+    Value coreId = coreIdCall.getResult();
+
+    // Build new argument list: format, cid, original_args...
+    SmallVector<Value> newArgs;
+    newArgs.push_back(callOp.getOperand(0)); // format string (first arg)
+    newArgs.push_back(coreId);                // core ID (new second arg)
+
+    // Add remaining original arguments (skip format which is operand 0)
+    for (unsigned i = 1; i < callOp.getNumOperands(); ++i) {
+      newArgs.push_back(callOp.getOperand(i));
+    }
+
+    // Replace with call to vx_printf
+    rewriter.replaceOpWithNewOp<LLVM::CallOp>(
+        callOp, vxPrintfFunc, newArgs);
+
+    return success();
+  }
+};
+
 /// Extract metadata from gpu.launch_func for Vortex kernel argument struct
 /// For RV32, all arguments are 4 bytes (scalars and pointers)
 struct LaunchFuncMetadataExtraction : public OpRewritePattern<gpu::LaunchFuncOp> {
@@ -469,9 +541,9 @@ struct ConvertGPUToVortexPass
       signalPassFailure();
     }
 
-    // Apply metadata extraction as a separate greedy rewrite
+    // Apply metadata extraction and printf lowering as separate greedy rewrites
     RewritePatternSet metadataPatterns(context);
-    metadataPatterns.add<LaunchFuncMetadataExtraction>(context);
+    metadataPatterns.add<LaunchFuncMetadataExtraction, PrintfOpLowering>(context);
     if (failed(applyPatternsAndFoldGreedily(module, std::move(metadataPatterns)))) {
       signalPassFailure();
     }
