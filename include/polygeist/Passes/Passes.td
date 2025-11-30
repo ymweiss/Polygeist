@@ -311,6 +311,10 @@ def ConvertGPUToVortex : Pass<"convert-gpu-to-vortex", "ModuleOp"> {
       %tid = gpu.thread_id x
     becomes:
       %tid = llvm.inline_asm "csrr $0, 0xCC0" : () -> i32
+
+    The pass automatically emits JSON metadata files describing kernel argument
+    layouts for runtime argument marshaling. Files are written to the current
+    working directory as <kernel_name>.meta.json.
   }];
   let constructor = "mlir::polygeist::createConvertGPUToVortexPass()";
   let dependentDialects = [
