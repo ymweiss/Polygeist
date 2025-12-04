@@ -317,8 +317,11 @@ struct BarrierOpLowering : public ConvertOpToLLVMPattern<gpu::BarrierOp> {
   matchAndRewrite(gpu::BarrierOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
-    auto module = op->getParentOfType<ModuleOp>();
-    MLIRContext *context = module.getContext();
+    // Declare functions in gpu.module (not top-level module) so they're visible
+    auto gpuModule = op->getParentOfType<gpu::GPUModuleOp>();
+    if (!gpuModule)
+      return failure();
+    MLIRContext *context = gpuModule.getContext();
 
     // Allocate barrier ID (simple counter for now)
     // TODO: Proper barrier ID allocation to avoid conflicts
@@ -330,28 +333,28 @@ struct BarrierOpLowering : public ConvertOpToLLVMPattern<gpu::BarrierOp> {
     auto barIdConstant = rewriter.create<LLVM::ConstantOp>(
         loc, i32Type, rewriter.getI32IntegerAttr(barrierId));
 
-    // Declare vx_num_warps function to get warp count
-    auto vxNumWarpsFunc = module.lookupSymbol<LLVM::LLVMFuncOp>("vx_num_warps");
+    // Declare vx_num_warps function in gpu.module if not already declared
+    auto vxNumWarpsFunc = gpuModule.lookupSymbol<LLVM::LLVMFuncOp>("vx_num_warps");
     if (!vxNumWarpsFunc) {
       OpBuilder::InsertionGuard guard(rewriter);
-      rewriter.setInsertionPointToStart(module.getBody());
+      rewriter.setInsertionPointToStart(gpuModule.getBody());
 
       auto funcType = LLVM::LLVMFunctionType::get(
           i32Type, {}, /*isVarArg=*/false);
 
       vxNumWarpsFunc = rewriter.create<LLVM::LLVMFuncOp>(
-          module.getLoc(), "vx_num_warps", funcType);
+          gpuModule.getLoc(), "vx_num_warps", funcType);
     }
 
     // Call vx_num_warps() to get number of warps
     auto numWarps = rewriter.create<LLVM::CallOp>(
         loc, vxNumWarpsFunc, ValueRange{});
 
-    // Declare vx_barrier function if not already declared
-    auto vxBarrierFunc = module.lookupSymbol<LLVM::LLVMFuncOp>("vx_barrier");
+    // Declare vx_barrier function in gpu.module if not already declared
+    auto vxBarrierFunc = gpuModule.lookupSymbol<LLVM::LLVMFuncOp>("vx_barrier");
     if (!vxBarrierFunc) {
       OpBuilder::InsertionGuard guard(rewriter);
-      rewriter.setInsertionPointToStart(module.getBody());
+      rewriter.setInsertionPointToStart(gpuModule.getBody());
 
       auto funcType = LLVM::LLVMFunctionType::get(
           LLVM::LLVMVoidType::get(context),
@@ -359,7 +362,7 @@ struct BarrierOpLowering : public ConvertOpToLLVMPattern<gpu::BarrierOp> {
           /*isVarArg=*/false);
 
       vxBarrierFunc = rewriter.create<LLVM::LLVMFuncOp>(
-          module.getLoc(), "vx_barrier", funcType);
+          gpuModule.getLoc(), "vx_barrier", funcType);
     }
 
     // Call vx_barrier(barrier_id, num_warps)
@@ -374,10 +377,10 @@ struct BarrierOpLowering : public ConvertOpToLLVMPattern<gpu::BarrierOp> {
   }
 };
 
-/// Lower printf calls to vx_printf with core ID as first argument
+/// Lower printf calls to vx_printf
 /// Matches: llvm.call @printf(format, args...)
-/// Replaces with: llvm.call @vx_printf(format, cid, args...)
-/// where cid = vx_core_id()
+/// Replaces with: llvm.call @vx_printf(format, args...)
+/// vx_printf has the same signature as standard printf
 struct PrintfOpLowering : public OpRewritePattern<LLVM::CallOp> {
   using OpRewritePattern<LLVM::CallOp>::OpRewritePattern;
 
@@ -401,17 +404,6 @@ struct PrintfOpLowering : public OpRewritePattern<LLVM::CallOp> {
     MLIRContext *context = gpuModule.getContext();
     auto i32Type = rewriter.getI32Type();
 
-    // Declare vx_core_id function in gpu.module if not already declared
-    auto vxCoreIdFunc = gpuModule.lookupSymbol<LLVM::LLVMFuncOp>("vx_core_id");
-    if (!vxCoreIdFunc) {
-      OpBuilder::InsertionGuard guard(rewriter);
-      rewriter.setInsertionPointToStart(gpuModule.getBody());
-
-      auto funcType = LLVM::LLVMFunctionType::get(i32Type, {}, /*isVarArg=*/false);
-      vxCoreIdFunc = rewriter.create<LLVM::LLVMFuncOp>(
-          gpuModule.getLoc(), "vx_core_id", funcType);
-    }
-
     // Declare vx_printf function in gpu.module if not already declared
     auto vxPrintfFunc = gpuModule.lookupSymbol<LLVM::LLVMFuncOp>("vx_printf");
     if (!vxPrintfFunc) {
@@ -424,17 +416,9 @@ struct PrintfOpLowering : public OpRewritePattern<LLVM::CallOp> {
           gpuModule.getLoc(), "vx_printf", funcType);
     }
 
-    // Call vx_core_id() to get core ID
-    auto coreIdCall = rewriter.create<LLVM::CallOp>(loc, vxCoreIdFunc, ValueRange{});
-    Value coreId = coreIdCall.getResult();
-
-    // Build new argument list: format, cid, original_args...
+    // Build argument list: pass all original arguments unchanged
     SmallVector<Value> newArgs;
-    newArgs.push_back(callOp.getOperand(0)); // format string (first arg)
-    newArgs.push_back(coreId);                // core ID (new second arg)
-
-    // Add remaining original arguments (skip format which is operand 0)
-    for (unsigned i = 1; i < callOp.getNumOperands(); ++i) {
+    for (unsigned i = 0; i < callOp.getNumOperands(); ++i) {
       newArgs.push_back(callOp.getOperand(i));
     }
 
