@@ -330,21 +330,22 @@ struct BarrierOpLowering : public ConvertOpToLLVMPattern<gpu::BarrierOp> {
     auto barIdConstant = rewriter.create<LLVM::ConstantOp>(
         loc, i32Type, rewriter.getI32IntegerAttr(barrierId));
 
-    // Get blockDim to calculate total threads
-    // We need blockDim.x * blockDim.y * blockDim.z
-    auto blockDimX = createDim3TLSAccess(op, rewriter, loc,
-                                         "blockDim", gpu::Dimension::x);
-    auto blockDimY = createDim3TLSAccess(op, rewriter, loc,
-                                         "blockDim", gpu::Dimension::y);
-    auto blockDimZ = createDim3TLSAccess(op, rewriter, loc,
-                                         "blockDim", gpu::Dimension::z);
+    // Declare vx_num_warps function to get warp count
+    auto vxNumWarpsFunc = module.lookupSymbol<LLVM::LLVMFuncOp>("vx_num_warps");
+    if (!vxNumWarpsFunc) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(module.getBody());
 
-    // Calculate total threads: x * y * z
-    // blockDimX/Y/Z are already i32 from TLS load
-    auto tempXY = rewriter.create<LLVM::MulOp>(loc, i32Type,
-                                                blockDimX, blockDimY);
-    auto numThreads = rewriter.create<LLVM::MulOp>(loc, i32Type,
-                                                     tempXY, blockDimZ);
+      auto funcType = LLVM::LLVMFunctionType::get(
+          i32Type, {}, /*isVarArg=*/false);
+
+      vxNumWarpsFunc = rewriter.create<LLVM::LLVMFuncOp>(
+          module.getLoc(), "vx_num_warps", funcType);
+    }
+
+    // Call vx_num_warps() to get number of warps
+    auto numWarps = rewriter.create<LLVM::CallOp>(
+        loc, vxNumWarpsFunc, ValueRange{});
 
     // Declare vx_barrier function if not already declared
     auto vxBarrierFunc = module.lookupSymbol<LLVM::LLVMFuncOp>("vx_barrier");
@@ -361,10 +362,10 @@ struct BarrierOpLowering : public ConvertOpToLLVMPattern<gpu::BarrierOp> {
           module.getLoc(), "vx_barrier", funcType);
     }
 
-    // Call vx_barrier(bar_id, num_threads)
+    // Call vx_barrier(barrier_id, num_warps)
     SmallVector<Value> args;
     args.push_back(barIdConstant.getResult());
-    args.push_back(numThreads.getResult());
+    args.push_back(numWarps.getResult());
 
     rewriter.replaceOpWithNewOp<LLVM::CallOp>(
         op, vxBarrierFunc, args);
