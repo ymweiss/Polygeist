@@ -80,6 +80,7 @@ void registerGpuSerializeToCubinPass();
 void registerGpuSerializeToHsacoPass();
 
 std::unique_ptr<Pass> createConvertGPUToVortexPass();
+std::unique_ptr<Pass> createGenerateVortexMainPass();
 
 void populateForBreakToWhilePatterns(RewritePatternSet &patterns);
 } // namespace polygeist

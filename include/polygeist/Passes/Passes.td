@@ -323,4 +323,29 @@ def ConvertGPUToVortex : Pass<"convert-gpu-to-vortex", "ModuleOp"> {
   ];
 }
 
+def GenerateVortexMain : Pass<"generate-vortex-main", "ModuleOp"> {
+  let summary = "Generate Vortex main() wrapper for kernel execution";
+  let description = [{
+    This pass generates the Vortex-specific main() entry point and kernel_body
+    wrapper function. It should run AFTER gpu-to-llvm lowering has converted
+    gpu.func to llvm.func.
+
+    The generated code:
+    1. main() function that:
+       - Reads kernel args from VX_CSR_MSCRATCH (0x340) via inline assembly
+       - Calls vx_spawn_threads() with grid dimensions and kernel callback
+    2. kernel_body() wrapper that:
+       - Takes void* args pointer
+       - Unpacks individual arguments from the struct
+       - Calls the original lowered kernel function
+
+    This matches the Vortex kernel execution model where kernels are launched
+    via vx_spawn_threads() with a callback function.
+  }];
+  let constructor = "mlir::polygeist::createGenerateVortexMainPass()";
+  let dependentDialects = [
+    "LLVM::LLVMDialect",
+  ];
+}
+
 #endif // POLYGEIST_PASSES
