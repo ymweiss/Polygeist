@@ -317,8 +317,8 @@ struct BarrierOpLowering : public ConvertOpToLLVMPattern<gpu::BarrierOp> {
   matchAndRewrite(gpu::BarrierOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
-    auto module = op->getParentOfType<ModuleOp>();
-    MLIRContext *context = module.getContext();
+    auto gpuModule = op->getParentOfType<gpu::GPUModuleOp>();
+    MLIRContext *context = gpuModule.getContext();
 
     // Allocate barrier ID (simple counter for now)
     // TODO: Proper barrier ID allocation to avoid conflicts
@@ -347,10 +347,10 @@ struct BarrierOpLowering : public ConvertOpToLLVMPattern<gpu::BarrierOp> {
                                                      tempXY, blockDimZ);
 
     // Declare vx_barrier function if not already declared
-    auto vxBarrierFunc = module.lookupSymbol<LLVM::LLVMFuncOp>("vx_barrier");
+    auto vxBarrierFunc = gpuModule.lookupSymbol<LLVM::LLVMFuncOp>("vx_barrier");
     if (!vxBarrierFunc) {
       OpBuilder::InsertionGuard guard(rewriter);
-      rewriter.setInsertionPointToStart(module.getBody());
+      rewriter.setInsertionPointToStart(gpuModule.getBody());
 
       auto funcType = LLVM::LLVMFunctionType::get(
           LLVM::LLVMVoidType::get(context),
@@ -358,7 +358,7 @@ struct BarrierOpLowering : public ConvertOpToLLVMPattern<gpu::BarrierOp> {
           /*isVarArg=*/false);
 
       vxBarrierFunc = rewriter.create<LLVM::LLVMFuncOp>(
-          module.getLoc(), "vx_barrier", funcType);
+          gpuModule.getLoc(), "vx_barrier", funcType);
     }
 
     // Call vx_barrier(bar_id, num_threads)
