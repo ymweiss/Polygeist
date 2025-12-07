@@ -214,11 +214,10 @@ static LLVM::LLVMFuncOp generateMainFunction(ModuleOp module,
 
   // 1. Read args from VX_CSR_MSCRATCH using inline assembly
   // csrr rd, 0x340
-  auto asmResultType = LLVM::LLVMStructType::getLiteral(ctx, {i32Type});
-
+  // Note: LLVM 18+ requires direct result type, not struct-wrapped
   auto inlineAsm = builder.create<LLVM::InlineAsmOp>(
       loc,
-      /*resultTypes=*/asmResultType,
+      /*resultTypes=*/i32Type,
       /*operands=*/ValueRange{},
       /*asm_string=*/"csrr $0, 0x340",
       /*constraints=*/"=r",
@@ -227,9 +226,8 @@ static LLVM::LLVMFuncOp generateMainFunction(ModuleOp module,
       /*asm_dialect=*/LLVM::AsmDialectAttr{},
       /*operand_attrs=*/ArrayAttr{});
 
-  // Extract the result from the struct
-  auto argsRaw = builder.create<LLVM::ExtractValueOp>(loc, i32Type,
-                                                       inlineAsm.getRes(), 0);
+  // Get the result directly (no struct extraction needed for single output)
+  auto argsRaw = inlineAsm.getRes();
 
   // Convert to pointer
   auto argsPtr = builder.create<LLVM::IntToPtrOp>(loc, ptrType, argsRaw);
