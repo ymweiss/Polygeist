@@ -19,6 +19,7 @@ add_mlir_dialect_library(MLIRPolygeistTransforms
   ForBreakToWhile.cpp
   ConvertParallelToGPU.cpp
   ConvertGPUToVortex.cpp
+  ReorderGPUKernelArgs.cpp
   GenerateVortexMain.cpp
   SerializeToCubin.cpp
   SerializeToHsaco.cpp

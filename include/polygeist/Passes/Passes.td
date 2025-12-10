@@ -300,6 +300,32 @@ def ConvertPolygeistToLLVM : Pass<"convert-polygeist-to-llvm", "mlir::ModuleOp">
   ];
 }
 
+def ReorderGPUKernelArgs : Pass<"reorder-gpu-kernel-args", "ModuleOp"> {
+  let summary = "Reorder GPU kernel arguments to match original HIP kernel signature";
+  let description = [{
+    Polygeist reorders GPU kernel arguments, placing scalars before pointers while
+    preserving relative order within each group. This transformation optimizes
+    memory access patterns but changes the ABI.
+
+    This pass undoes that reordering, restoring arguments to their original order
+    as declared in the HIP kernel signature. This is necessary for interoperability
+    with host code that expects arguments in the original order.
+
+    The pass:
+    1. Extracts original argument order from host wrapper functions
+    2. Creates new GPU functions with arguments in original order
+    3. Updates all gpu.launch_func call sites to pass arguments in the new order
+    4. Replaces the original GPU functions with the reordered versions
+
+    This pass should run BEFORE convert-gpu-to-vortex.
+  }];
+  let constructor = "mlir::polygeist::createReorderGPUKernelArgsPass()";
+  let dependentDialects = [
+    "gpu::GPUDialect",
+    "func::FuncDialect",
+  ];
+}
+
 def ConvertGPUToVortex : Pass<"convert-gpu-to-vortex", "ModuleOp"> {
   let summary = "Lower GPU dialect operations to Vortex RISC-V intrinsics";
   let description = [{

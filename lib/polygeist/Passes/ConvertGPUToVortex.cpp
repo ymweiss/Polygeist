@@ -872,10 +872,8 @@ static std::string generateMetadataJSON(const KernelMetadata &meta,
 /// Extract metadata from a GPU function and write metadata files
 /// Generates both .meta.json (for runtime) and _args.h (for compile-time)
 /// If outputDir is empty, uses current working directory
-/// Uses pre-built originalArgIsPointer map for computing argument order mapping
-static void emitKernelMetadata(gpu::GPUFuncOp funcOp,
-                                StringRef outputDir,
-                                const llvm::StringMap<std::vector<bool>> &originalArgIsPointer) {
+/// Note: Arguments are now already in original order after reorderGPUKernelArguments
+static void emitKernelMetadata(gpu::GPUFuncOp funcOp, StringRef outputDir) {
   if (!funcOp.isKernel())
     return;
 
@@ -972,7 +970,8 @@ static void emitKernelMetadata(gpu::GPUFuncOp funcOp,
     outDir = outputDir;
   }
 
-  // Write JSON metadata file (with original order mapping if available)
+  // Write JSON metadata file
+  // Note: Arguments are now in original order, no mapping needed
   {
     SmallString<256> jsonPath(outDir);
     llvm::sys::path::append(jsonPath, meta.kernelName + ".meta.json");
@@ -983,7 +982,7 @@ static void emitKernelMetadata(gpu::GPUFuncOp funcOp,
       llvm::errs() << "Error writing metadata file " << jsonPath << ": "
                    << ec.message() << "\n";
     } else {
-      outFile << generateMetadataJSON(meta, originalOrder);
+      outFile << generateMetadataJSON(meta);  // No original_arg_order needed
       outFile.close();
       llvm::outs() << "Wrote kernel metadata: " << jsonPath << "\n";
     }
@@ -1056,7 +1055,7 @@ struct ConvertGPUToVortexPass
     // Files are written to current working directory:
     //   - <kernel_name>.meta.json (for runtime dynamic loading)
     //   - <kernel_name>_args.h (for compile-time type-safe usage)
-    // Pass pre-built argument order map for original argument positions
+    // Note: Arguments should be in original order if reorder-gpu-kernel-args pass ran first
     module.walk([&](gpu::GPUModuleOp gpuModule) {
       for (auto gpuFunc : gpuModule.getOps<gpu::GPUFuncOp>()) {
         if (gpuFunc.isKernel()) {
