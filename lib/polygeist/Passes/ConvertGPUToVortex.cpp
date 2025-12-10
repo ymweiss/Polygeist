@@ -12,10 +12,15 @@
 //===----------------------------------------------------------------------===//
 
 #include "mlir/Conversion/LLVMCommon/ConversionTarget.h"
+#include "mlir/Conversion/LLVMCommon/MemRefBuilder.h"
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "polygeist/Passes/Passes.h"
@@ -41,6 +46,7 @@ constexpr uint32_t VX_CSR_CORE_ID = 0xCC2;
 constexpr uint32_t VX_CSR_NUM_THREADS = 0xFC0;
 constexpr uint32_t VX_CSR_NUM_WARPS = 0xFC1;
 constexpr uint32_t VX_CSR_NUM_CORES = 0xFC2;
+constexpr uint32_t VX_CSR_LOCAL_MEM_BASE = 0xFC3;
 
 //===----------------------------------------------------------------------===//
 // Preprocessing: Consolidate Polygeist Alternatives
@@ -333,8 +339,9 @@ struct BarrierOpLowering : public ConvertOpToLLVMPattern<gpu::BarrierOp> {
     auto barIdConstant = rewriter.create<LLVM::ConstantOp>(
         loc, i32Type, rewriter.getI32IntegerAttr(barrierId));
 
-    // Declare vx_num_warps function in gpu.module if not already declared
-    auto vxNumWarpsFunc = gpuModule.lookupSymbol<LLVM::LLVMFuncOp>("vx_num_warps");
+    // Declare vx_num_warps_abi function in gpu.module if not already declared
+    // Using _abi suffix to call the non-inline wrapper in vx_intrinsics_abi.c
+    auto vxNumWarpsFunc = gpuModule.lookupSymbol<LLVM::LLVMFuncOp>("vx_num_warps_abi");
     if (!vxNumWarpsFunc) {
       OpBuilder::InsertionGuard guard(rewriter);
       rewriter.setInsertionPointToStart(gpuModule.getBody());
@@ -343,15 +350,16 @@ struct BarrierOpLowering : public ConvertOpToLLVMPattern<gpu::BarrierOp> {
           i32Type, {}, /*isVarArg=*/false);
 
       vxNumWarpsFunc = rewriter.create<LLVM::LLVMFuncOp>(
-          gpuModule.getLoc(), "vx_num_warps", funcType);
+          gpuModule.getLoc(), "vx_num_warps_abi", funcType);
     }
 
-    // Call vx_num_warps() to get number of warps
+    // Call vx_num_warps_abi() to get number of warps
     auto numWarps = rewriter.create<LLVM::CallOp>(
         loc, vxNumWarpsFunc, ValueRange{});
 
-    // Declare vx_barrier function in gpu.module if not already declared
-    auto vxBarrierFunc = gpuModule.lookupSymbol<LLVM::LLVMFuncOp>("vx_barrier");
+    // Declare vx_barrier_abi function in gpu.module if not already declared
+    // Using _abi suffix to call the non-inline wrapper in vx_intrinsics_abi.c
+    auto vxBarrierFunc = gpuModule.lookupSymbol<LLVM::LLVMFuncOp>("vx_barrier_abi");
     if (!vxBarrierFunc) {
       OpBuilder::InsertionGuard guard(rewriter);
       rewriter.setInsertionPointToStart(gpuModule.getBody());
@@ -362,10 +370,10 @@ struct BarrierOpLowering : public ConvertOpToLLVMPattern<gpu::BarrierOp> {
           /*isVarArg=*/false);
 
       vxBarrierFunc = rewriter.create<LLVM::LLVMFuncOp>(
-          gpuModule.getLoc(), "vx_barrier", funcType);
+          gpuModule.getLoc(), "vx_barrier_abi", funcType);
     }
 
-    // Call vx_barrier(barrier_id, num_warps)
+    // Call vx_barrier_abi(barrier_id, num_warps)
     SmallVector<Value> args;
     args.push_back(barIdConstant.getResult());
     args.push_back(numWarps.getResult());
@@ -425,6 +433,236 @@ struct PrintfOpLowering : public OpRewritePattern<LLVM::CallOp> {
     // Replace with call to vx_printf
     rewriter.replaceOpWithNewOp<LLVM::CallOp>(
         callOp, vxPrintfFunc, newArgs);
+
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// Shared Memory Lowering (Address Space 3)
+//===----------------------------------------------------------------------===//
+
+/// Track shared memory allocations for computing offsets
+/// Maps global name to (offset, size) within the shared memory region
+static llvm::StringMap<std::pair<unsigned, unsigned>> sharedMemoryLayout;
+static unsigned totalSharedMemorySize = 0;
+
+/// Get or declare the __local_group_id TLS variable accessor
+/// Returns a function that provides access to the per-warp group ID
+static LLVM::LLVMFuncOp getOrCreateLocalGroupIdAccessor(Operation *op,
+                                                         OpBuilder &builder) {
+  // Find the parent module (works for both gpu.module and regular module)
+  Operation *symbolTableOp = op->getParentOfType<gpu::GPUModuleOp>();
+  if (!symbolTableOp)
+    symbolTableOp = op->getParentOfType<ModuleOp>();
+  if (!symbolTableOp)
+    return nullptr;
+
+  std::string funcName = "vx_get_local_group_id";
+
+  // Check if function already exists
+  if (auto existing = SymbolTable::lookupSymbolIn(symbolTableOp,
+                                                   builder.getStringAttr(funcName))) {
+    return cast<LLVM::LLVMFuncOp>(existing);
+  }
+
+  // Create function type: () -> i32 (returns the local group ID)
+  auto i32Type = builder.getI32Type();
+  auto funcType = LLVM::LLVMFunctionType::get(i32Type, {}, /*isVarArg=*/false);
+
+  // Declare external function
+  OpBuilder::InsertionGuard guard(builder);
+  if (auto gpuModule = dyn_cast<gpu::GPUModuleOp>(symbolTableOp)) {
+    builder.setInsertionPointToStart(gpuModule.getBody());
+  } else if (auto module = dyn_cast<ModuleOp>(symbolTableOp)) {
+    builder.setInsertionPointToStart(module.getBody());
+  }
+
+  return builder.create<LLVM::LLVMFuncOp>(
+      symbolTableOp->getLoc(),
+      funcName,
+      funcType,
+      LLVM::Linkage::External);
+}
+
+/// Lower memref.global with address space 3 (shared memory)
+/// These become placeholders - the actual allocation is done by vx_spawn_threads
+/// We record the size and assign offsets for memref.get_global to use
+struct SharedMemoryGlobalOpLowering : public OpRewritePattern<memref::GlobalOp> {
+  using OpRewritePattern<memref::GlobalOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(memref::GlobalOp globalOp,
+                                 PatternRewriter &rewriter) const override {
+    // Only handle address space 3 (shared memory)
+    auto memrefType = globalOp.getType();
+    if (memrefType.getMemorySpaceAsInt() != 3)
+      return failure();
+
+    // Skip if already processed
+    if (globalOp->hasAttr("vortex.shared_memory_offset"))
+      return failure();
+
+    // Calculate the size of this shared memory allocation
+    unsigned elementSize = 4;  // Default to 4 bytes
+    Type elemType = memrefType.getElementType();
+    if (elemType.isF32() || elemType.isInteger(32))
+      elementSize = 4;
+    else if (elemType.isF64() || elemType.isInteger(64))
+      elementSize = 8;
+    else if (elemType.isInteger(8))
+      elementSize = 1;
+    else if (elemType.isInteger(16) || elemType.isF16())
+      elementSize = 2;
+
+    unsigned numElements = 1;
+    for (int64_t dim : memrefType.getShape()) {
+      if (dim == ShapedType::kDynamic) {
+        // Dynamic shared memory - can't compute static offset
+        globalOp.emitWarning("Dynamic shared memory size not supported");
+        return failure();
+      }
+      numElements *= dim;
+    }
+    unsigned totalBytes = numElements * elementSize;
+
+    // Assign offset in shared memory layout
+    unsigned offset = totalSharedMemorySize;
+    sharedMemoryLayout[globalOp.getSymName()] = {offset, totalBytes};
+    totalSharedMemorySize += totalBytes;
+
+    // Mark as processed with offset attribute
+    rewriter.startRootUpdate(globalOp);
+    globalOp->setAttr("vortex.shared_memory_offset",
+                      rewriter.getI32IntegerAttr(offset));
+    globalOp->setAttr("vortex.shared_memory_size",
+                      rewriter.getI32IntegerAttr(totalBytes));
+    rewriter.finalizeRootUpdate(globalOp);
+
+    return success();
+  }
+};
+
+/// Lower memref.get_global with address space 3 to Vortex local memory access
+/// Generates: (int8_t*)csr_read(VX_CSR_LOCAL_MEM_BASE) + __local_group_id * total_size + offset
+/// Returns a proper memref descriptor for use with memref load/store operations
+struct SharedMemoryGetGlobalOpLowering
+    : public ConvertOpToLLVMPattern<memref::GetGlobalOp> {
+  using ConvertOpToLLVMPattern<memref::GetGlobalOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(memref::GetGlobalOp getGlobalOp, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    // Only handle address space 3 (shared memory)
+    auto memrefType = getGlobalOp.getType();
+    if (memrefType.getMemorySpaceAsInt() != 3)
+      return failure();
+
+    // Only handle static shapes (required for MemRefDescriptor::fromStaticShape)
+    if (!memrefType.hasStaticShape()) {
+      getGlobalOp.emitError("Dynamic shared memory shapes not supported");
+      return failure();
+    }
+
+    Location loc = getGlobalOp.getLoc();
+    MLIRContext *context = getGlobalOp.getContext();
+
+    // Look up the offset for this global
+    StringRef globalName = getGlobalOp.getName();
+    auto it = sharedMemoryLayout.find(globalName);
+    if (it == sharedMemoryLayout.end()) {
+      // Not found - this can happen if GlobalOp lowering hasn't run yet
+      // Try to find the GlobalOp and compute offset
+      auto module = getGlobalOp->getParentOfType<ModuleOp>();
+      auto gpuModule = getGlobalOp->getParentOfType<gpu::GPUModuleOp>();
+      Operation *symbolTable = gpuModule ? (Operation*)gpuModule : (Operation*)module;
+
+      if (auto globalOp = SymbolTable::lookupSymbolIn(symbolTable,
+                                                       getGlobalOp.getNameAttr())) {
+        if (auto memGlobalOp = dyn_cast<memref::GlobalOp>(globalOp)) {
+          if (auto offsetAttr = memGlobalOp->getAttrOfType<IntegerAttr>(
+                  "vortex.shared_memory_offset")) {
+            unsigned offset = offsetAttr.getInt();
+            unsigned size = 0;
+            if (auto sizeAttr = memGlobalOp->getAttrOfType<IntegerAttr>(
+                    "vortex.shared_memory_size")) {
+              size = sizeAttr.getInt();
+            }
+            sharedMemoryLayout[globalName] = {offset, size};
+            it = sharedMemoryLayout.find(globalName);
+          }
+        }
+      }
+
+      if (it == sharedMemoryLayout.end()) {
+        getGlobalOp.emitError("Shared memory global not found in layout: ")
+            << globalName;
+        return failure();
+      }
+    }
+
+    unsigned offset = it->second.first;
+    auto i32Type = rewriter.getI32Type();
+
+    // Get pointer type with address space 3 for shared memory
+    unsigned addressSpace = memrefType.getMemorySpaceAsInt();
+    Type elementType = getTypeConverter()->convertType(memrefType.getElementType());
+    auto ptrType = getTypeConverter()->getPointerType(elementType, addressSpace);
+
+    // Generate CSR read for local memory base
+    // csrr %0, 0xFC3 (VX_CSR_LOCAL_MEM_BASE)
+    std::string csrAsmStr = "csrr $0, " + std::to_string(VX_CSR_LOCAL_MEM_BASE);
+
+    auto csrRead = rewriter.create<LLVM::InlineAsmOp>(
+        loc,
+        i32Type,             // result type (single i32, not a struct)
+        ValueRange{},        // operands
+        csrAsmStr,           // asm string
+        "=r",                // constraints: output to register
+        /*has_side_effects=*/false,
+        /*is_align_stack=*/false,
+        /*asm_dialect=*/nullptr,
+        /*operand_attrs=*/nullptr);
+
+    // The CSR read returns the base address directly
+    Value baseAddr = csrRead.getResult(0);
+
+    // Get __local_group_id via external function call
+    auto localGroupIdFunc = getOrCreateLocalGroupIdAccessor(
+        getGlobalOp, rewriter);
+    if (!localGroupIdFunc)
+      return failure();
+
+    auto localGroupIdCall = rewriter.create<LLVM::CallOp>(
+        loc, localGroupIdFunc, ValueRange{});
+    Value localGroupId = localGroupIdCall.getResult();
+
+    // Calculate final address:
+    // base + localGroupId * totalSharedMemorySize + offset
+    //
+    // Note: For now, we use totalSharedMemorySize computed so far.
+    // A more robust approach would compute this in a second pass.
+    Value totalSizeVal = rewriter.create<LLVM::ConstantOp>(
+        loc, i32Type, rewriter.getI32IntegerAttr(totalSharedMemorySize));
+    Value groupOffset = rewriter.create<LLVM::MulOp>(
+        loc, i32Type, localGroupId, totalSizeVal);
+    Value baseWithGroup = rewriter.create<LLVM::AddOp>(
+        loc, i32Type, baseAddr, groupOffset);
+
+    // Add the static offset for this specific global
+    Value offsetVal = rewriter.create<LLVM::ConstantOp>(
+        loc, i32Type, rewriter.getI32IntegerAttr(offset));
+    Value finalAddr = rewriter.create<LLVM::AddOp>(
+        loc, i32Type, baseWithGroup, offsetVal);
+
+    // Convert to pointer
+    Value ptr = rewriter.create<LLVM::IntToPtrOp>(loc, ptrType, finalAddr);
+
+    // Create a memref descriptor from the computed pointer
+    // This creates a proper LLVM struct with allocated_ptr, aligned_ptr, offset, sizes, strides
+    Value descr = MemRefDescriptor::fromStaticShape(
+        rewriter, loc, *getTypeConverter(), memrefType, ptr);
+
+    rewriter.replaceOp(getGlobalOp, descr);
 
     return success();
   }
@@ -514,7 +752,7 @@ static std::string getMetadataTypeString(Type type) {
   if (type.isF64())
     return "f64";
   if (type.isIndex())
-    return "i32";  // Index maps to i32 on RV32
+    return "i64";  // Index maps to i64 by default in LLVM lowering
   return "unknown";
 }
 
@@ -523,10 +761,10 @@ static unsigned getTypeSizeRV32(Type type) {
   // On RV32 Vortex, pointers are 4 bytes
   if (type.isa<MemRefType>() || type.isa<LLVM::LLVMPointerType>())
     return 4;
-  if (type.isInteger(32) || type.isF32() || type.isIndex())
+  if (type.isInteger(32) || type.isF32())
     return 4;
-  if (type.isInteger(64) || type.isF64())
-    return 8;
+  if (type.isInteger(64) || type.isF64() || type.isIndex())
+    return 8;  // Index maps to i64 in LLVM lowering
   return 4;  // Default
 }
 
@@ -617,10 +855,33 @@ static void emitKernelMetadata(gpu::GPUFuncOp funcOp,
   StringRef baseName = extractBaseKernelName(funcOp.getName());
   meta.kernelName = baseName.str();
 
+  // Count leading scalar args before any memrefs/pointers
+  // These are typically derived from block_dim (e.g., block_dim.x)
+  // and should be skipped in user arg metadata since kernel_body
+  // derives them from the block_dim header, not user args.
+  auto argTypes = funcOp.getArgumentTypes();
+  unsigned numLeadingScalars = 0;
+  for (auto argType : argTypes) {
+    if (argType.isa<MemRefType>() || argType.isa<LLVM::LLVMPointerType>()) {
+      break;
+    }
+    ++numLeadingScalars;
+  }
+
+  // Skip first 2 leading scalars (derived from block_dim[0])
+  // These are: arg0 = block_dim.x as index, arg1 = block_dim.x as i32
+  unsigned argsToSkip = (numLeadingScalars >= 2) ? 2 : 0;
+
   unsigned offset = 0;
   unsigned argIndex = 0;
 
-  for (auto argType : funcOp.getArgumentTypes()) {
+  for (auto argType : argTypes) {
+    if (argIndex < argsToSkip) {
+      // Skip this arg - it comes from block_dim header, not user args
+      argIndex++;
+      continue;
+    }
+
     KernelArgInfo argInfo;
     argInfo.name = "arg" + std::to_string(argIndex);
     argInfo.type = getMetadataTypeString(argType);
@@ -736,12 +997,130 @@ struct ConvertGPUToVortexPass
       signalPassFailure();
     }
 
-    // Apply metadata extraction and printf lowering as separate greedy rewrites
+    // Apply metadata extraction, printf lowering, and shared memory global annotation
+    // as separate greedy rewrites (these patterns don't replace ops, just annotate)
     RewritePatternSet metadataPatterns(context);
-    metadataPatterns.add<LaunchFuncMetadataExtraction, PrintfOpLowering>(context);
+    metadataPatterns.add<LaunchFuncMetadataExtraction, PrintfOpLowering,
+                         SharedMemoryGlobalOpLowering>(context);
     if (failed(applyPatternsAndFoldGreedily(module, std::move(metadataPatterns)))) {
       signalPassFailure();
     }
+
+    // Lower memref.get_global for address space 3 (shared memory) to Vortex intrinsics
+    // This must run after SharedMemoryGlobalOpLowering has annotated the globals
+    {
+      ConversionTarget sharedMemTarget(*context);
+      sharedMemTarget.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
+      sharedMemTarget.addDynamicallyLegalOp<memref::GetGlobalOp>(
+          [](memref::GetGlobalOp op) {
+            // Only make shared memory (address space 3) get_global ops illegal
+            return op.getType().getMemorySpaceAsInt() != 3;
+          });
+
+      RewritePatternSet sharedMemPatterns(context);
+      sharedMemPatterns.add<SharedMemoryGetGlobalOpLowering>(typeConverter);
+
+      if (failed(applyPartialConversion(module, sharedMemTarget,
+                                         std::move(sharedMemPatterns)))) {
+        signalPassFailure();
+      }
+    }
+
+    // Remove gpu.launch_func operations - they were needed for Polygeist
+    // to generate proper MLIR but are not needed for Vortex kernel compilation.
+    // The host code handles kernel launching through the Vortex runtime separately.
+    SmallVector<gpu::LaunchFuncOp> launchOps;
+    module.walk([&](gpu::LaunchFuncOp launchOp) {
+      launchOps.push_back(launchOp);
+    });
+    for (auto launchOp : launchOps) {
+      launchOp.erase();
+    }
+
+    // Remove host-side functions (those outside gpu.module)
+    // Keep only the kernel code inside gpu.module for kernel binary compilation
+    SmallVector<func::FuncOp> hostFuncs;
+    for (auto funcOp : module.getOps<func::FuncOp>()) {
+      hostFuncs.push_back(funcOp);
+    }
+    for (auto funcOp : hostFuncs) {
+      funcOp.erase();
+    }
+
+    // Extract kernel functions from gpu.module and convert to func.func
+    // This allows standard MLIR lowering passes to work on the kernel code
+    OpBuilder builder(context);
+    SmallVector<gpu::GPUModuleOp> gpuModulesToErase;
+
+    module.walk([&](gpu::GPUModuleOp gpuModule) {
+      // Clone kernel functions as func.func at module level
+      for (auto gpuFunc : gpuModule.getOps<gpu::GPUFuncOp>()) {
+        // Create func.func with same name and type
+        builder.setInsertionPointToEnd(module.getBody());
+
+        auto funcOp = builder.create<func::FuncOp>(
+            gpuFunc.getLoc(),
+            gpuFunc.getName(),
+            gpuFunc.getFunctionType());
+
+        // Don't copy GPU-specific attributes - they're not relevant for Vortex
+        // Skipped attributes: gpu.kernel, gpu.known_block_size, nvvm.*, rocdl.*
+        // The kernel will use Vortex runtime conventions instead
+
+        // Clone the function body
+        IRMapping mapping;
+        gpuFunc.getBody().cloneInto(&funcOp.getBody(), mapping);
+
+        // Replace gpu.return with func.return in the cloned body
+        funcOp.walk([&](gpu::ReturnOp returnOp) {
+          OpBuilder returnBuilder(returnOp);
+          returnBuilder.create<func::ReturnOp>(returnOp.getLoc(),
+                                                returnOp.getOperands());
+          returnOp.erase();
+        });
+
+        // Replace unrealized_conversion_cast (i32 -> index) with arith.index_cast
+        // These come from Polygeist's type conversions and can't be reconciled as-is
+        SmallVector<UnrealizedConversionCastOp> castsToReplace;
+        funcOp.walk([&](UnrealizedConversionCastOp castOp) {
+          // Only replace i32 -> index casts
+          if (castOp.getNumOperands() == 1 && castOp.getNumResults() == 1) {
+            auto srcType = castOp.getOperand(0).getType();
+            auto dstType = castOp.getResult(0).getType();
+            if (srcType.isInteger(32) && dstType.isIndex()) {
+              castsToReplace.push_back(castOp);
+            }
+          }
+        });
+        for (auto castOp : castsToReplace) {
+          OpBuilder castBuilder(castOp);
+          auto indexCast = castBuilder.create<arith::IndexCastOp>(
+              castOp.getLoc(), castOp.getResult(0).getType(), castOp.getOperand(0));
+          castOp.getResult(0).replaceAllUsesWith(indexCast.getResult());
+          castOp.erase();
+        }
+      }
+
+      // Also clone any llvm.func declarations (like vx_get_threadIdx)
+      for (auto llvmFunc : gpuModule.getOps<LLVM::LLVMFuncOp>()) {
+        builder.setInsertionPointToEnd(module.getBody());
+        // Check if already exists at module level
+        if (!module.lookupSymbol(llvmFunc.getName())) {
+          llvmFunc.clone();
+          builder.clone(*llvmFunc.getOperation());
+        }
+      }
+
+      gpuModulesToErase.push_back(gpuModule);
+    });
+
+    // Erase the gpu.module after extracting all functions
+    for (auto gpuModule : gpuModulesToErase) {
+      gpuModule.erase();
+    }
+
+    // Remove gpu.container_module attribute since we no longer have gpu.module
+    module->removeAttr("gpu.container_module");
   }
 };
 
