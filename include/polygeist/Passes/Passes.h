@@ -79,6 +79,7 @@ createGpuSerializeToHsacoPass(StringRef arch, StringRef features,
 void registerGpuSerializeToCubinPass();
 void registerGpuSerializeToHsacoPass();
 
+std::unique_ptr<Pass> createReorderGPUKernelArgsPass();
 std::unique_ptr<Pass> createConvertGPUToVortexPass();
 std::unique_ptr<Pass> createGenerateVortexMainPass();
 

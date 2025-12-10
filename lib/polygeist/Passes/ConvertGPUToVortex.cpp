@@ -872,10 +872,8 @@ static std::string generateMetadataJSON(const KernelMetadata &meta,
 /// Extract metadata from a GPU function and write metadata files
 /// Generates both .meta.json (for runtime) and _args.h (for compile-time)
 /// If outputDir is empty, uses current working directory
-/// Uses pre-built originalArgIsPointer map for computing argument order mapping
-static void emitKernelMetadata(gpu::GPUFuncOp funcOp,
-                                StringRef outputDir,
-                                const llvm::StringMap<std::vector<bool>> &originalArgIsPointer) {
+/// Note: Arguments are now already in original order after reorderGPUKernelArguments
+static void emitKernelMetadata(gpu::GPUFuncOp funcOp, StringRef outputDir) {
   if (!funcOp.isKernel())
     return;
 
@@ -928,42 +926,6 @@ static void emitKernelMetadata(gpu::GPUFuncOp funcOp,
 
   meta.totalArgsSize = offset;
 
-  // Look up pre-computed original argument types from host wrapper
-  // Base name should match the host wrapper function name
-  std::vector<unsigned> originalOrder;
-
-  auto it = originalArgIsPointer.find(baseName);
-  if (it != originalArgIsPointer.end()) {
-    const std::vector<bool> &hostIsPointer = it->second;
-
-    if (hostIsPointer.size() == meta.arguments.size()) {
-      // Build mapping from original order to device order
-      // Device order: scalars first, then pointers (preserving relative order)
-      // Original order: as declared in kernel signature
-
-      // Count scalars in host (original) order
-      unsigned numScalars = 0;
-      for (bool isPtr : hostIsPointer) {
-        if (!isPtr) numScalars++;
-      }
-
-      // Build the mapping: original_arg_order[device_idx] = original_idx
-      originalOrder.resize(hostIsPointer.size());
-      unsigned deviceScalarIdx = 0;
-      unsigned devicePtrIdx = numScalars;
-
-      for (unsigned origIdx = 0; origIdx < hostIsPointer.size(); ++origIdx) {
-        if (!hostIsPointer[origIdx]) {
-          // Scalar - goes to front of device args
-          originalOrder[deviceScalarIdx++] = origIdx;
-        } else {
-          // Pointer - goes to back of device args
-          originalOrder[devicePtrIdx++] = origIdx;
-        }
-      }
-    }
-  }
-
   // Determine output directory
   SmallString<256> outDir;
   if (outputDir.empty()) {
@@ -972,7 +934,8 @@ static void emitKernelMetadata(gpu::GPUFuncOp funcOp,
     outDir = outputDir;
   }
 
-  // Write JSON metadata file (with original order mapping if available)
+  // Write JSON metadata file
+  // Note: Arguments are now in original order, no mapping needed
   {
     SmallString<256> jsonPath(outDir);
     llvm::sys::path::append(jsonPath, meta.kernelName + ".meta.json");
@@ -983,7 +946,7 @@ static void emitKernelMetadata(gpu::GPUFuncOp funcOp,
       llvm::errs() << "Error writing metadata file " << jsonPath << ": "
                    << ec.message() << "\n";
     } else {
-      outFile << generateMetadataJSON(meta, originalOrder);
+      outFile << generateMetadataJSON(meta);  // No original_arg_order needed
       outFile.close();
       llvm::outs() << "Wrote kernel metadata: " << jsonPath << "\n";
     }
@@ -1025,28 +988,6 @@ struct ConvertGPUToVortexPass
     MLIRContext *context = &getContext();
     ModuleOp module = getOperation();
 
-    // FIRST: Build argument order map from host wrapper functions BEFORE any changes
-    // This maps kernel base name -> list of (isPointer, type) for original args
-    llvm::StringMap<std::vector<bool>> originalArgIsPointer;
-
-    // Find host wrapper functions (func.func @__polygeist_launch_<name>)
-    for (auto funcOp : module.getOps<func::FuncOp>()) {
-      StringRef funcName = funcOp.getName();
-      if (!funcName.startswith("__polygeist_launch_"))
-        continue;
-
-      // Host wrapper args: user args... + blocks + threads (last 2 are launch params)
-      auto hostArgTypes = funcOp.getArgumentTypes();
-      unsigned numHostUserArgs = hostArgTypes.size() > 2 ? hostArgTypes.size() - 2 : 0;
-
-      std::vector<bool> isPointerVec;
-      for (unsigned i = 0; i < numHostUserArgs; ++i) {
-        isPointerVec.push_back(hostArgTypes[i].isa<MemRefType>() ||
-                               hostArgTypes[i].isa<LLVM::LLVMPointerType>());
-      }
-      originalArgIsPointer[funcName] = std::move(isPointerVec);
-    }
-
     // PREPROCESSING: Consolidate Polygeist auto-tuning artifacts
     // This must happen before any conversion patterns are applied
     consolidatePolygeistAlternatives(module);
@@ -1056,11 +997,11 @@ struct ConvertGPUToVortexPass
     // Files are written to current working directory:
     //   - <kernel_name>.meta.json (for runtime dynamic loading)
     //   - <kernel_name>_args.h (for compile-time type-safe usage)
-    // Pass pre-built argument order map for original argument positions
+    // Note: Arguments should be in original order if reorder-gpu-kernel-args pass ran first
     module.walk([&](gpu::GPUModuleOp gpuModule) {
       for (auto gpuFunc : gpuModule.getOps<gpu::GPUFuncOp>()) {
         if (gpuFunc.isKernel()) {
-          emitKernelMetadata(gpuFunc, "" /* use current directory */, originalArgIsPointer);
+          emitKernelMetadata(gpuFunc, "" /* use current directory */);
         }
       }
     });
