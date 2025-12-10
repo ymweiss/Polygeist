@@ -23,6 +23,7 @@
 #include "polygeist/Passes/Passes.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include <limits>
 
 using namespace mlir;
 using namespace mlir::LLVM;
@@ -87,9 +88,40 @@ getOrDeclareVxSpawnThreads(ModuleOp module, OpBuilder &builder) {
                                           funcType, LLVM::Linkage::External);
 }
 
+/// Check if a sequence of parameter types represents a memref descriptor
+/// LLVM memref descriptor format: { ptr, ptr, i64, [1 x i64], [1 x i64] }
+/// After flattening, this becomes: ptr, ptr, i64, i64, i64 (for 1D memref)
+static bool isMemrefDescriptorStart(LLVM::LLVMFunctionType funcType,
+                                     unsigned startIdx) {
+  unsigned numParams = funcType.getNumParams();
+  // Need at least 5 params remaining for a 1D memref descriptor
+  if (startIdx + 5 > numParams)
+    return false;
+
+  Type t0 = funcType.getParamType(startIdx);
+  Type t1 = funcType.getParamType(startIdx + 1);
+  Type t2 = funcType.getParamType(startIdx + 2);
+  Type t3 = funcType.getParamType(startIdx + 3);
+  Type t4 = funcType.getParamType(startIdx + 4);
+
+  // Check pattern: ptr, ptr, i64, i64, i64
+  return t0.isa<LLVM::LLVMPointerType>() &&
+         t1.isa<LLVM::LLVMPointerType>() && t2.isInteger(64) &&
+         t3.isInteger(64) && t4.isInteger(64);
+}
+
 /// Generate kernel_body wrapper function
 /// This function unpacks arguments from the void* args pointer and calls
 /// the original kernel function
+///
+/// IMPORTANT: Polygeist transforms kernel signatures to add computed arguments
+/// from the launch configuration. The first few kernel args may come from
+/// block_dim (e.g., block_dim.x as both index and i32), not from user args.
+///
+/// This handles the memref descriptor expansion that happens during
+/// LLVM lowering. Each memref<?xf32> in the original kernel becomes 5 params
+/// (ptr, ptr, i64, i64, i64) after lowering. The host passes simple device
+/// pointers, so we must construct the full descriptor from each pointer.
 static LLVM::LLVMFuncOp
 generateKernelBodyWrapper(ModuleOp module, LLVM::LLVMFuncOp kernelFunc,
                           OpBuilder &builder) {
@@ -99,6 +131,7 @@ generateKernelBodyWrapper(ModuleOp module, LLVM::LLVMFuncOp kernelFunc,
   auto ptrType = LLVM::LLVMPointerType::get(ctx);
   auto voidType = LLVM::LLVMVoidType::get(ctx);
   auto i32Type = IntegerType::get(ctx, 32);
+  auto i64Type = IntegerType::get(ctx, 64);
 
   // Create function: void kernel_body(void* args)
   auto funcType =
@@ -120,58 +153,133 @@ generateKernelBodyWrapper(ModuleOp module, LLVM::LLVMFuncOp kernelFunc,
   auto kernelFuncType = kernelFunc.getFunctionType();
   unsigned numArgs = kernelFuncType.getNumParams();
 
-  // Calculate offset for user args (skip grid_dim[3] and block_dim[3])
   // Standard Vortex args layout:
   //   uint32_t grid_dim[3];   // 12 bytes (offsets 0, 4, 8)
   //   uint32_t block_dim[3];  // 12 bytes (offsets 12, 16, 20)
   //   <user args>             // starting at offset 24
+  //
+  // IMPORTANT: Polygeist transforms kernel args during GPU lowering. The first
+  // two kernel args are typically derived from block_dim.x (threads_per_block):
+  //   arg0 = block_dim.x as i64 (index type)
+  //   arg1 = block_dim.x as i32
+  // These should be loaded from block_dim[0] in the header, not from user args.
+  // The remaining args (arg2+) come from the user args buffer.
+  constexpr unsigned BLOCK_DIM_OFFSET = 12;
   constexpr unsigned USER_ARGS_OFFSET = 24;
 
   SmallVector<Value> unpackedArgs;
   unsigned currentOffset = USER_ARGS_OFFSET;
+  auto i8Type = IntegerType::get(ctx, 8);
 
+  // Count leading scalar args before any memrefs/pointers
+  // These are typically derived from launch config (block_dim)
+  unsigned numLeadingScalars = 0;
   for (unsigned i = 0; i < numArgs; ++i) {
     Type argType = kernelFuncType.getParamType(i);
+    if (isMemrefDescriptorStart(kernelFuncType, i) ||
+        argType.isa<LLVM::LLVMPointerType>()) {
+      break;
+    }
+    ++numLeadingScalars;
+  }
 
-    // Create GEP to access the argument at currentOffset
-    // We treat the args struct as an array of bytes and use byte offsets
-    auto i8Type = IntegerType::get(ctx, 8);
-
-    // GEP to byte offset - use GEPArg for indices
+  // Pre-load block_dim[0] for the first two args (if needed)
+  Value blockDimX_i32 = nullptr;
+  Value blockDimX_i64 = nullptr;
+  if (numLeadingScalars >= 2) {
     SmallVector<LLVM::GEPArg> gepIndices;
-    gepIndices.push_back(static_cast<int32_t>(currentOffset));
-    auto argBytePtr =
+    gepIndices.push_back(static_cast<int32_t>(BLOCK_DIM_OFFSET));
+    auto blockDimPtr =
         builder.create<LLVM::GEPOp>(loc, ptrType, i8Type, argsPtr, gepIndices);
+    blockDimX_i32 = builder.create<LLVM::LoadOp>(loc, i32Type, blockDimPtr);
+    blockDimX_i64 = builder.create<LLVM::ZExtOp>(loc, i64Type, blockDimX_i32);
+  }
 
-    // Load the argument value
-    Value argVal;
-    if (argType.isa<LLVM::LLVMPointerType>()) {
-      // For pointers: load as i32 (RV32 pointer), then inttoptr
+  for (unsigned i = 0; i < numArgs; ) {
+    Type argType = kernelFuncType.getParamType(i);
+
+    // Check if this is the start of a memref descriptor (5 consecutive params)
+    if (isMemrefDescriptorStart(kernelFuncType, i)) {
+      // This is a memref descriptor - load single pointer from args and expand
+      SmallVector<LLVM::GEPArg> gepIndices;
+      gepIndices.push_back(static_cast<int32_t>(currentOffset));
+      auto argBytePtr = builder.create<LLVM::GEPOp>(loc, ptrType, i8Type,
+                                                     argsPtr, gepIndices);
+
+      // Load the device pointer (4 bytes on RV32)
       auto rawPtr = builder.create<LLVM::LoadOp>(loc, i32Type, argBytePtr);
-      argVal = builder.create<LLVM::IntToPtrOp>(loc, ptrType, rawPtr);
-      currentOffset += 4; // Pointers are 4 bytes on RV32
-    } else if (argType.isInteger(32) || argType.isIndex()) {
-      argVal = builder.create<LLVM::LoadOp>(loc, i32Type, argBytePtr);
-      currentOffset += 4;
-    } else if (argType.isInteger(64)) {
-      auto i64Type = IntegerType::get(ctx, 64);
-      argVal = builder.create<LLVM::LoadOp>(loc, i64Type, argBytePtr);
-      currentOffset += 8;
-    } else if (argType.isF32()) {
-      auto f32Type = Float32Type::get(ctx);
-      argVal = builder.create<LLVM::LoadOp>(loc, f32Type, argBytePtr);
-      currentOffset += 4;
-    } else if (argType.isF64()) {
-      auto f64Type = Float64Type::get(ctx);
-      argVal = builder.create<LLVM::LoadOp>(loc, f64Type, argBytePtr);
-      currentOffset += 8;
+      auto devicePtr = builder.create<LLVM::IntToPtrOp>(loc, ptrType, rawPtr);
+
+      // Construct memref descriptor values:
+      // param 0: allocated pointer (same as device ptr)
+      // param 1: aligned pointer (same as device ptr)
+      // param 2: offset (0)
+      // param 3: size (use large value, kernel will bounds check)
+      // param 4: stride (1 for contiguous)
+      unpackedArgs.push_back(devicePtr);                    // allocated ptr
+      unpackedArgs.push_back(devicePtr);                    // aligned ptr
+
+      auto zeroI64 = builder.create<LLVM::ConstantOp>(loc, i64Type, 0);
+      auto maxI64 = builder.create<LLVM::ConstantOp>(
+          loc, i64Type, std::numeric_limits<int64_t>::max());
+      auto oneI64 = builder.create<LLVM::ConstantOp>(loc, i64Type, 1);
+
+      unpackedArgs.push_back(zeroI64);  // offset = 0
+      unpackedArgs.push_back(maxI64);   // size = MAX (kernel has bounds check)
+      unpackedArgs.push_back(oneI64);   // stride = 1
+
+      currentOffset += 4; // Single pointer in args buffer
+      i += 5;             // Skip 5 params (the whole memref descriptor)
+      continue;
+    }
+
+    // Scalar argument handling
+    Value argVal;
+
+    // First two leading scalars come from block_dim[0], not user args
+    // arg0 = block_dim.x as i64 (for index type in LLVM lowering)
+    // arg1 = block_dim.x as i32
+    if (i < 2 && numLeadingScalars >= 2) {
+      if (argType.isInteger(64)) {
+        argVal = blockDimX_i64;
+      } else {
+        argVal = blockDimX_i32;
+      }
     } else {
-      // Default: treat as 4-byte value
-      argVal = builder.create<LLVM::LoadOp>(loc, i32Type, argBytePtr);
-      currentOffset += 4;
+      // Regular user argument from user args buffer
+      SmallVector<LLVM::GEPArg> gepIndices;
+      gepIndices.push_back(static_cast<int32_t>(currentOffset));
+      auto argBytePtr =
+          builder.create<LLVM::GEPOp>(loc, ptrType, i8Type, argsPtr, gepIndices);
+
+      if (argType.isa<LLVM::LLVMPointerType>()) {
+        // For pointers: load as i32 (RV32 pointer), then inttoptr
+        auto rawPtr = builder.create<LLVM::LoadOp>(loc, i32Type, argBytePtr);
+        argVal = builder.create<LLVM::IntToPtrOp>(loc, ptrType, rawPtr);
+        currentOffset += 4;
+      } else if (argType.isInteger(32)) {
+        argVal = builder.create<LLVM::LoadOp>(loc, i32Type, argBytePtr);
+        currentOffset += 4;
+      } else if (argType.isInteger(64)) {
+        argVal = builder.create<LLVM::LoadOp>(loc, i64Type, argBytePtr);
+        currentOffset += 8;
+      } else if (argType.isF32()) {
+        auto f32Type = Float32Type::get(ctx);
+        argVal = builder.create<LLVM::LoadOp>(loc, f32Type, argBytePtr);
+        currentOffset += 4;
+      } else if (argType.isF64()) {
+        auto f64Type = Float64Type::get(ctx);
+        argVal = builder.create<LLVM::LoadOp>(loc, f64Type, argBytePtr);
+        currentOffset += 8;
+      } else {
+        // Default: treat as 4-byte value
+        argVal = builder.create<LLVM::LoadOp>(loc, i32Type, argBytePtr);
+        currentOffset += 4;
+      }
     }
 
     unpackedArgs.push_back(argVal);
+    ++i;
   }
 
   // Call the original kernel function
