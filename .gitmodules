@@ -1,3 +1,4 @@
 [submodule "llvm-project"]
 	path = llvm-project
-	url = https://github.com/llvm/llvm-project.git
+	url = https://github.com/ymweiss/llvm-project.git
+	branch = yaakov/kernel-arg-mapping-polygeist-base

@@ -300,6 +300,32 @@ def ConvertPolygeistToLLVM : Pass<"convert-polygeist-to-llvm", "mlir::ModuleOp">
   ];
 }
 
+def ReorderGPUKernelArgs : Pass<"reorder-gpu-kernel-args", "ModuleOp"> {
+  let summary = "Reorder GPU kernel arguments to match original HIP kernel signature";
+  let description = [{
+    Polygeist reorders GPU kernel arguments, placing scalars before pointers while
+    preserving relative order within each group. This transformation optimizes
+    memory access patterns but changes the ABI.
+
+    This pass undoes that reordering, restoring arguments to their original order
+    as declared in the HIP kernel signature. This is necessary for interoperability
+    with host code that expects arguments in the original order.
+
+    The pass:
+    1. Extracts original argument order from host wrapper functions
+    2. Creates new GPU functions with arguments in original order
+    3. Updates all gpu.launch_func call sites to pass arguments in the new order
+    4. Replaces the original GPU functions with the reordered versions
+
+    This pass should run BEFORE convert-gpu-to-vortex.
+  }];
+  let constructor = "mlir::polygeist::createReorderGPUKernelArgsPass()";
+  let dependentDialects = [
+    "gpu::GPUDialect",
+    "func::FuncDialect",
+  ];
+}
+
 def ConvertGPUToVortex : Pass<"convert-gpu-to-vortex", "ModuleOp"> {
   let summary = "Lower GPU dialect operations to Vortex RISC-V intrinsics";
   let description = [{
@@ -345,6 +371,47 @@ def GenerateVortexMain : Pass<"generate-vortex-main", "ModuleOp"> {
   let constructor = "mlir::polygeist::createGenerateVortexMainPass()";
   let dependentDialects = [
     "LLVM::LLVMDialect",
+  ];
+}
+
+def InsertVortexDivergence : Pass<"insert-vortex-divergence", "ModuleOp"> {
+  let summary = "Insert vx_split/vx_join around divergent branches for Vortex";
+  let description = [{
+    This pass handles SIMT divergence for the Vortex GPGPU. Unlike NVIDIA GPUs
+    which handle divergence in hardware, Vortex requires explicit vx_split()
+    and vx_join() calls around divergent branches.
+
+    The pass:
+    1. Performs divergence analysis to find values dependent on thread ID
+       (values derived from vx_get_threadIdx calls)
+    2. Identifies conditional branches with divergent conditions
+    3. Inserts vx_split_abi(condition) before each divergent branch
+    4. Inserts vx_join_abi(stack_ptr) at the convergence point (post-dominator)
+
+    This should run AFTER convert-gpu-to-vortex (which lowers gpu.thread_id to
+    vx_get_threadIdx calls) and BEFORE generate-vortex-main.
+
+    Example transformation:
+      // Before:
+      cf.cond_br %divergent_cond, ^true, ^false
+      ^true: ...
+      ^false: ...
+      ^merge: ...
+
+      // After:
+      %sp = llvm.call @vx_split_abi(%divergent_cond)
+      cf.cond_br %divergent_cond, ^true, ^false
+      ^true: ...
+      ^false: ...
+      ^merge:
+        llvm.call @vx_join_abi(%sp)
+        ...
+  }];
+  let constructor = "mlir::polygeist::createInsertVortexDivergencePass()";
+  let dependentDialects = [
+    "LLVM::LLVMDialect",
+    "cf::ControlFlowDialect",
+    "func::FuncDialect",
   ];
 }
 
