@@ -110,108 +110,13 @@ static bool isMemrefDescriptorStart(LLVM::LLVMFunctionType funcType,
          t3.isInteger(64) && t4.isInteger(64);
 }
 
-/// Analyze kernel function to find the user arg range.
-/// Looks for vortex.kernel_arg_ranges on the module, then falls back to heuristic.
-/// Returns {userArgStartLLVM, userArgCount} where userArgStartLLVM is the
-/// position in the LLVM function signature (accounting for memref expansion).
-static std::pair<unsigned, unsigned>
-findUserArgRange(LLVM::LLVMFuncOp kernelFunc, ModuleOp module) {
-  auto kernelFuncType = kernelFunc.getFunctionType();
-  unsigned numLLVMArgs = kernelFuncType.getNumParams();
-
-  StringRef kernelName = kernelFunc.getName();
-
-  // Look for module-level vortex.kernel_arg_ranges attribute
-  unsigned userArgStart = 0;
-  unsigned userArgCount = 0;
-  bool foundAttr = false;
-
-  if (auto rangesDict = module->getAttrOfType<DictionaryAttr>("vortex.kernel_arg_ranges")) {
-    if (auto rangeAttr = rangesDict.getAs<DenseI64ArrayAttr>(kernelName)) {
-      auto range = rangeAttr.asArrayRef();
-      if (range.size() == 2) {
-        userArgStart = static_cast<unsigned>(range[0]);
-        userArgCount = static_cast<unsigned>(range[1]);
-        foundAttr = true;
-      }
-    }
-  }
-
-  if (foundAttr) {
-    // Convert from MLIR arg positions to LLVM arg positions
-    // MLIR memrefs become 5 LLVM params each
-    // We need to count how many LLVM params come before userArgStart
-    unsigned llvmArgPos = 0;
-    unsigned mlirArgPos = 0;
-
-    // Count LLVM params for args before userArgStart
-    while (mlirArgPos < userArgStart && llvmArgPos < numLLVMArgs) {
-      if (isMemrefDescriptorStart(kernelFuncType, llvmArgPos)) {
-        llvmArgPos += 5;  // memref expands to 5 params
-      } else {
-        llvmArgPos += 1;
-      }
-      mlirArgPos += 1;
-    }
-
-    return {llvmArgPos, userArgCount};
-  }
-
-  // Fallback: use heuristic based on signature pattern
-  // After ReorderGPUKernelArgs, user args are contiguous and include all pointers
-  // Synthetic args are i64 scalars at the boundaries
-
-  // Count leading i64 scalars (before first memref/pointer)
-  unsigned numLeadingScalars = 0;
-  for (unsigned i = 0; i < numLLVMArgs; ++i) {
-    Type argType = kernelFuncType.getParamType(i);
-    if (isMemrefDescriptorStart(kernelFuncType, i) ||
-        argType.isa<LLVM::LLVMPointerType>()) {
-      break;
-    }
-    if (argType.isInteger(64)) {
-      ++numLeadingScalars;
-    } else {
-      break; // Non-i64 scalar is a user arg
-    }
-  }
-
-  // Count trailing i64 scalars (after last memref/pointer)
-  unsigned numTrailingScalars = 0;
-  for (unsigned i = numLLVMArgs; i > 0; --i) {
-    Type argType = kernelFuncType.getParamType(i - 1);
-    if (argType.isInteger(64)) {
-      ++numTrailingScalars;
-    } else {
-      break;
-    }
-  }
-
-  // User args are everything in between
-  unsigned argsToSkip = numLeadingScalars;
-
-  // Count MLIR-level user args (group memref descriptors)
-  userArgCount = 0;
-  for (unsigned i = argsToSkip; i < numLLVMArgs - numTrailingScalars; ) {
-    if (isMemrefDescriptorStart(kernelFuncType, i)) {
-      userArgCount += 1;
-      i += 5;
-    } else {
-      userArgCount += 1;
-      i += 1;
-    }
-  }
-
-  return {argsToSkip, userArgCount};
-}
-
 /// Generate kernel_body wrapper function
 /// This function unpacks arguments from the void* args pointer and calls
 /// the original kernel function
 ///
-/// IMPORTANT: After ReorderGPUKernelArgs pass, user args are in a contiguous
-/// range marked by the vortex.user_arg_range attribute. Synthetic args
-/// (derived from block_dim) are outside this range.
+/// IMPORTANT: Polygeist transforms kernel signatures to add computed arguments
+/// from the launch configuration. The first few kernel args may come from
+/// block_dim (e.g., block_dim.x as both index and i32), not from user args.
 ///
 /// This handles the memref descriptor expansion that happens during
 /// LLVM lowering. Each memref<?xf32> in the original kernel becomes 5 params
@@ -252,32 +157,24 @@ generateKernelBodyWrapper(ModuleOp module, LLVM::LLVMFuncOp kernelFunc,
   //   uint32_t grid_dim[3];   // 12 bytes (offsets 0, 4, 8)
   //   uint32_t block_dim[3];  // 12 bytes (offsets 12, 16, 20)
   //   <user args>             // starting at offset 24
+  //
+  // IMPORTANT: Polygeist transforms kernel args during GPU lowering. The first
+  // two kernel args are typically derived from block_dim.x (threads_per_block):
+  //   arg0 = block_dim.x as i64 (index type)
+  //   arg1 = block_dim.x as i32
+  // These should be loaded from block_dim[0] in the header, not from user args.
+  // The remaining args (arg2+) come from the user args buffer.
   constexpr unsigned BLOCK_DIM_OFFSET = 12;
   constexpr unsigned USER_ARGS_OFFSET = 24;
-
-  // Find user arg range (accounts for ReorderGPUKernelArgs)
-  auto [userArgStartLLVM, userArgCount] = findUserArgRange(kernelFunc, module);
 
   SmallVector<Value> unpackedArgs;
   unsigned currentOffset = USER_ARGS_OFFSET;
   auto i8Type = IntegerType::get(ctx, 8);
 
-  // Pre-load block_dim[0] for synthetic args
-  Value blockDimX_i32 = nullptr;
-  Value blockDimX_i64 = nullptr;
-  {
-    SmallVector<LLVM::GEPArg> gepIndices;
-    gepIndices.push_back(static_cast<int32_t>(BLOCK_DIM_OFFSET));
-    auto blockDimPtr =
-        builder.create<LLVM::GEPOp>(loc, ptrType, i8Type, argsPtr, gepIndices);
-    blockDimX_i32 = builder.create<LLVM::LoadOp>(loc, i32Type, blockDimPtr);
-    blockDimX_i64 = builder.create<LLVM::ZExtOp>(loc, i64Type, blockDimX_i32);
-  }
-
-  // Track MLIR arg index for user arg range check
-  unsigned mlirArgIdx = 0;
-
-  for (unsigned i = 0; i < numArgs; ) {
+  // Count leading scalar args before any memrefs/pointers
+  // These are typically derived from launch config (block_dim)
+  unsigned numLeadingScalars = 0;
+  for (unsigned i = 0; i < numArgs; ++i) {
     Type argType = kernelFuncType.getParamType(i);
     if (isMemrefDescriptorStart(kernelFuncType, i) ||
         argType.isa<LLVM::LLVMPointerType>()) {
@@ -286,68 +183,77 @@ generateKernelBodyWrapper(ModuleOp module, LLVM::LLVMFuncOp kernelFunc,
     ++numLeadingScalars;
   }
 
-    // Check if this LLVM arg position is within the user arg range
-    bool isUserArg = (mlirArgIdx >= userArgStartLLVM &&
-                      mlirArgIdx < userArgStartLLVM + userArgCount);
+  // Pre-load block_dim[0] for the first two args (if needed)
+  Value blockDimX_i32 = nullptr;
+  Value blockDimX_i64 = nullptr;
+  if (numLeadingScalars >= 2) {
+    SmallVector<LLVM::GEPArg> gepIndices;
+    gepIndices.push_back(static_cast<int32_t>(BLOCK_DIM_OFFSET));
+    auto blockDimPtr =
+        builder.create<LLVM::GEPOp>(loc, ptrType, i8Type, argsPtr, gepIndices);
+    blockDimX_i32 = builder.create<LLVM::LoadOp>(loc, i32Type, blockDimPtr);
+    blockDimX_i64 = builder.create<LLVM::ZExtOp>(loc, i64Type, blockDimX_i32);
+  }
+
+  for (unsigned i = 0; i < numArgs; ) {
+    Type argType = kernelFuncType.getParamType(i);
 
     // Check if this is the start of a memref descriptor (5 consecutive params)
     if (isMemrefDescriptorStart(kernelFuncType, i)) {
-      if (isUserArg) {
-        // User memref - load from user args buffer
-        SmallVector<LLVM::GEPArg> gepIndices;
-        gepIndices.push_back(static_cast<int32_t>(currentOffset));
-        auto argBytePtr = builder.create<LLVM::GEPOp>(loc, ptrType, i8Type,
-                                                       argsPtr, gepIndices);
+      // This is a memref descriptor - load single pointer from args and expand
+      SmallVector<LLVM::GEPArg> gepIndices;
+      gepIndices.push_back(static_cast<int32_t>(currentOffset));
+      auto argBytePtr = builder.create<LLVM::GEPOp>(loc, ptrType, i8Type,
+                                                     argsPtr, gepIndices);
 
-        // Load the device pointer (4 bytes on RV32)
-        auto rawPtr = builder.create<LLVM::LoadOp>(loc, i32Type, argBytePtr);
-        auto devicePtr = builder.create<LLVM::IntToPtrOp>(loc, ptrType, rawPtr);
+      // Load the device pointer (4 bytes on RV32)
+      auto rawPtr = builder.create<LLVM::LoadOp>(loc, i32Type, argBytePtr);
+      auto devicePtr = builder.create<LLVM::IntToPtrOp>(loc, ptrType, rawPtr);
 
-        // Construct memref descriptor values
-        unpackedArgs.push_back(devicePtr);  // allocated ptr
-        unpackedArgs.push_back(devicePtr);  // aligned ptr
+      // Construct memref descriptor values:
+      // param 0: allocated pointer (same as device ptr)
+      // param 1: aligned pointer (same as device ptr)
+      // param 2: offset (0)
+      // param 3: size (use large value, kernel will bounds check)
+      // param 4: stride (1 for contiguous)
+      unpackedArgs.push_back(devicePtr);                    // allocated ptr
+      unpackedArgs.push_back(devicePtr);                    // aligned ptr
 
-        auto zeroI64 = builder.create<LLVM::ConstantOp>(loc, i64Type, 0);
-        auto maxI64 = builder.create<LLVM::ConstantOp>(
-            loc, i64Type, std::numeric_limits<int64_t>::max());
-        auto oneI64 = builder.create<LLVM::ConstantOp>(loc, i64Type, 1);
+      auto zeroI64 = builder.create<LLVM::ConstantOp>(loc, i64Type, 0);
+      auto maxI64 = builder.create<LLVM::ConstantOp>(
+          loc, i64Type, std::numeric_limits<int64_t>::max());
+      auto oneI64 = builder.create<LLVM::ConstantOp>(loc, i64Type, 1);
 
-        unpackedArgs.push_back(zeroI64);  // offset = 0
-        unpackedArgs.push_back(maxI64);   // size = MAX
-        unpackedArgs.push_back(oneI64);   // stride = 1
+      unpackedArgs.push_back(zeroI64);  // offset = 0
+      unpackedArgs.push_back(maxI64);   // size = MAX (kernel has bounds check)
+      unpackedArgs.push_back(oneI64);   // stride = 1
 
-        currentOffset += 4;  // Single pointer in args buffer
-      } else {
-        // Synthetic memref - shouldn't happen, but handle gracefully
-        // Use null pointer
-        auto nullPtr = builder.create<LLVM::ZeroOp>(loc, ptrType);
-        unpackedArgs.push_back(nullPtr);  // allocated ptr
-        unpackedArgs.push_back(nullPtr);  // aligned ptr
-        auto zeroI64 = builder.create<LLVM::ConstantOp>(loc, i64Type, 0);
-        auto maxI64 = builder.create<LLVM::ConstantOp>(
-            loc, i64Type, std::numeric_limits<int64_t>::max());
-        auto oneI64 = builder.create<LLVM::ConstantOp>(loc, i64Type, 1);
-        unpackedArgs.push_back(zeroI64);
-        unpackedArgs.push_back(maxI64);
-        unpackedArgs.push_back(oneI64);
-      }
-
-      i += 5;  // Skip 5 params (the whole memref descriptor)
-      mlirArgIdx += 1;
+      currentOffset += 4; // Single pointer in args buffer
+      i += 5;             // Skip 5 params (the whole memref descriptor)
       continue;
     }
 
     // Scalar argument handling
     Value argVal;
 
-    if (isUserArg) {
-      // User scalar - load from user args buffer
+    // First two leading scalars come from block_dim[0], not user args
+    // arg0 = block_dim.x as i64 (for index type in LLVM lowering)
+    // arg1 = block_dim.x as i32
+    if (i < 2 && numLeadingScalars >= 2) {
+      if (argType.isInteger(64)) {
+        argVal = blockDimX_i64;
+      } else {
+        argVal = blockDimX_i32;
+      }
+    } else {
+      // Regular user argument from user args buffer
       SmallVector<LLVM::GEPArg> gepIndices;
       gepIndices.push_back(static_cast<int32_t>(currentOffset));
       auto argBytePtr =
           builder.create<LLVM::GEPOp>(loc, ptrType, i8Type, argsPtr, gepIndices);
 
       if (argType.isa<LLVM::LLVMPointerType>()) {
+        // For pointers: load as i32 (RV32 pointer), then inttoptr
         auto rawPtr = builder.create<LLVM::LoadOp>(loc, i32Type, argBytePtr);
         argVal = builder.create<LLVM::IntToPtrOp>(loc, ptrType, rawPtr);
         currentOffset += 4;
@@ -366,21 +272,14 @@ generateKernelBodyWrapper(ModuleOp module, LLVM::LLVMFuncOp kernelFunc,
         argVal = builder.create<LLVM::LoadOp>(loc, f64Type, argBytePtr);
         currentOffset += 8;
       } else {
+        // Default: treat as 4-byte value
         argVal = builder.create<LLVM::LoadOp>(loc, i32Type, argBytePtr);
         currentOffset += 4;
-      }
-    } else {
-      // Synthetic scalar - derive from block_dim
-      if (argType.isInteger(64)) {
-        argVal = blockDimX_i64;
-      } else {
-        argVal = blockDimX_i32;
       }
     }
 
     unpackedArgs.push_back(argVal);
     ++i;
-    mlirArgIdx += 1;
   }
 
   // Call the original kernel function

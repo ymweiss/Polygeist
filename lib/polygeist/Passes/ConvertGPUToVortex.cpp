@@ -892,15 +892,6 @@ static void emitKernelMetadata(gpu::GPUFuncOp funcOp, StringRef outputDir) {
   // The mapping tells us which host wrapper arg each kernel arg came from.
   // Host wrapper signature is: (user_args..., gridDim, blockDim)
   // So any kernel arg that maps to host arg index < (total_host_args - 2) is a user arg.
-  //
-  // Example for relu:
-  //   Kernel args: (%arg0: memref, %arg1: memref, %arg2: i32, %arg3: index, %arg4: i32)
-  //   Mapping: [0, 1, 2, 4, 4]
-  //   Host wrapper has 5 args: (input, output, n, gridDim, blockDim)
-  //   User args are host args 0, 1, 2 (indices < 3)
-  //   So kernel args 0, 1, 2 are user args (they map to host args 0, 1, 2)
-  //   Kernel args 3, 4 are synthetic (they map to host arg 4 = blockDim)
-
   SmallVector<unsigned> userArgIndices;
 
   if (auto mappingAttr = funcOp->getAttrOfType<DenseI64ArrayAttr>("kernel_arg_mapping")) {
@@ -919,30 +910,17 @@ static void emitKernelMetadata(gpu::GPUFuncOp funcOp, StringRef outputDir) {
 
     // Collect kernel arg indices that map to user args
     // Use a set to track which host args we've already seen (for deduplication)
-    // When a host arg is used multiple times (e.g., as i32 and as index after index_cast),
-    // we only want to include it once in the user args.
     llvm::SmallSet<int64_t, 8> seenHostArgs;
     for (unsigned i = 0; i < mapping.size(); ++i) {
       int64_t hostIdx = mapping[i];
       if (hostIdx >= 0 && static_cast<unsigned>(hostIdx) < userArgThreshold) {
-        // Only include this kernel arg if we haven't seen this host arg yet
         if (seenHostArgs.insert(hostIdx).second) {
           userArgIndices.push_back(i);
         }
       }
     }
-  } else if (auto rangeAttr = funcOp->getAttrOfType<DenseI64ArrayAttr>("vortex.user_arg_range")) {
-    // Fallback: use vortex.user_arg_range attribute from ReorderGPUKernelArgs pass
-    auto range = rangeAttr.asArrayRef();
-    if (range.size() == 2) {
-      unsigned start = static_cast<unsigned>(range[0]);
-      unsigned count = static_cast<unsigned>(range[1]);
-      for (unsigned i = 0; i < count; ++i) {
-        userArgIndices.push_back(start + i);
-      }
-    }
   } else {
-    // Final fallback: assume all args except last 2 are user args
+    // Fallback: assume all args except last 2 are user args
     unsigned userArgCount = (totalArgs >= 2) ? totalArgs - 2 : totalArgs;
     for (unsigned i = 0; i < userArgCount; ++i) {
       userArgIndices.push_back(i);
@@ -969,42 +947,6 @@ static void emitKernelMetadata(gpu::GPUFuncOp funcOp, StringRef outputDir) {
 
   meta.totalArgsSize = offset;
 
-  // Look up pre-computed original argument types from host wrapper
-  // Base name should match the host wrapper function name
-  std::vector<unsigned> originalOrder;
-
-  auto it = originalArgIsPointer.find(baseName);
-  if (it != originalArgIsPointer.end()) {
-    const std::vector<bool> &hostIsPointer = it->second;
-
-    if (hostIsPointer.size() == meta.arguments.size()) {
-      // Build mapping from original order to device order
-      // Device order: scalars first, then pointers (preserving relative order)
-      // Original order: as declared in kernel signature
-
-      // Count scalars in host (original) order
-      unsigned numScalars = 0;
-      for (bool isPtr : hostIsPointer) {
-        if (!isPtr) numScalars++;
-      }
-
-      // Build the mapping: original_arg_order[device_idx] = original_idx
-      originalOrder.resize(hostIsPointer.size());
-      unsigned deviceScalarIdx = 0;
-      unsigned devicePtrIdx = numScalars;
-
-      for (unsigned origIdx = 0; origIdx < hostIsPointer.size(); ++origIdx) {
-        if (!hostIsPointer[origIdx]) {
-          // Scalar - goes to front of device args
-          originalOrder[deviceScalarIdx++] = origIdx;
-        } else {
-          // Pointer - goes to back of device args
-          originalOrder[devicePtrIdx++] = origIdx;
-        }
-      }
-    }
-  }
-
   // Determine output directory
   SmallString<256> outDir;
   if (outputDir.empty()) {
@@ -1013,8 +955,7 @@ static void emitKernelMetadata(gpu::GPUFuncOp funcOp, StringRef outputDir) {
     outDir = outputDir;
   }
 
-  // Write JSON metadata file
-  // Note: Arguments are now in original order, no mapping needed
+  // Write JSON metadata file (with original order mapping if available)
   {
     SmallString<256> jsonPath(outDir);
     llvm::sys::path::append(jsonPath, meta.kernelName + ".meta.json");
@@ -1025,7 +966,7 @@ static void emitKernelMetadata(gpu::GPUFuncOp funcOp, StringRef outputDir) {
       llvm::errs() << "Error writing metadata file " << jsonPath << ": "
                    << ec.message() << "\n";
     } else {
-      outFile << generateMetadataJSON(meta);  // No original_arg_order needed
+      outFile << generateMetadataJSON(meta);
       outFile.close();
       llvm::outs() << "Wrote kernel metadata: " << jsonPath << "\n";
     }
@@ -1067,28 +1008,6 @@ struct ConvertGPUToVortexPass
     MLIRContext *context = &getContext();
     ModuleOp module = getOperation();
 
-    // FIRST: Build argument order map from host wrapper functions BEFORE any changes
-    // This maps kernel base name -> list of (isPointer, type) for original args
-    llvm::StringMap<std::vector<bool>> originalArgIsPointer;
-
-    // Find host wrapper functions (func.func @__polygeist_launch_<name>)
-    for (auto funcOp : module.getOps<func::FuncOp>()) {
-      StringRef funcName = funcOp.getName();
-      if (!funcName.startswith("__polygeist_launch_"))
-        continue;
-
-      // Host wrapper args: user args... + blocks + threads (last 2 are launch params)
-      auto hostArgTypes = funcOp.getArgumentTypes();
-      unsigned numHostUserArgs = hostArgTypes.size() > 2 ? hostArgTypes.size() - 2 : 0;
-
-      std::vector<bool> isPointerVec;
-      for (unsigned i = 0; i < numHostUserArgs; ++i) {
-        isPointerVec.push_back(hostArgTypes[i].isa<MemRefType>() ||
-                               hostArgTypes[i].isa<LLVM::LLVMPointerType>());
-      }
-      originalArgIsPointer[funcName] = std::move(isPointerVec);
-    }
-
     // PREPROCESSING: Consolidate Polygeist auto-tuning artifacts
     // This must happen before any conversion patterns are applied
     consolidatePolygeistAlternatives(module);
@@ -1098,11 +1017,11 @@ struct ConvertGPUToVortexPass
     // Files are written to current working directory:
     //   - <kernel_name>.meta.json (for runtime dynamic loading)
     //   - <kernel_name>_args.h (for compile-time type-safe usage)
-    // Note: Arguments should be in original order if reorder-gpu-kernel-args pass ran first
+    // Uses kernel_arg_mapping attribute to identify user args
     module.walk([&](gpu::GPUModuleOp gpuModule) {
       for (auto gpuFunc : gpuModule.getOps<gpu::GPUFuncOp>()) {
         if (gpuFunc.isKernel()) {
-          emitKernelMetadata(gpuFunc, "" /* use current directory */, originalArgIsPointer);
+          emitKernelMetadata(gpuFunc, "" /* use current directory */);
         }
       }
     });
