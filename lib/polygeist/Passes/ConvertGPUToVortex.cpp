@@ -24,6 +24,7 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "polygeist/Passes/Passes.h"
+#include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
@@ -872,7 +873,7 @@ static std::string generateMetadataJSON(const KernelMetadata &meta,
 /// Extract metadata from a GPU function and write metadata files
 /// Generates both .meta.json (for runtime) and _args.h (for compile-time)
 /// If outputDir is empty, uses current working directory
-/// Note: Arguments are now already in original order after reorderGPUKernelArguments
+/// Uses kernel_arg_mapping attribute to identify which kernel args are user args
 static void emitKernelMetadata(gpu::GPUFuncOp funcOp, StringRef outputDir) {
   if (!funcOp.isKernel())
     return;
@@ -887,37 +888,71 @@ static void emitKernelMetadata(gpu::GPUFuncOp funcOp, StringRef outputDir) {
   auto argTypes = funcOp.getArgumentTypes();
   unsigned totalArgs = argTypes.size();
 
-  // Check for vortex.user_arg_range attribute from ReorderGPUKernelArgs pass
-  // Format: [start_index, count]
-  unsigned userArgStart = 0;
-  unsigned userArgCount = totalArgs;
+  // Use kernel_arg_mapping attribute to identify user args
+  // The mapping tells us which host wrapper arg each kernel arg came from.
+  // Host wrapper signature is: (user_args..., gridDim, blockDim)
+  // So any kernel arg that maps to host arg index < (total_host_args - 2) is a user arg.
+  //
+  // Example for relu:
+  //   Kernel args: (%arg0: memref, %arg1: memref, %arg2: i32, %arg3: index, %arg4: i32)
+  //   Mapping: [0, 1, 2, 4, 4]
+  //   Host wrapper has 5 args: (input, output, n, gridDim, blockDim)
+  //   User args are host args 0, 1, 2 (indices < 3)
+  //   So kernel args 0, 1, 2 are user args (they map to host args 0, 1, 2)
+  //   Kernel args 3, 4 are synthetic (they map to host arg 4 = blockDim)
 
-  if (auto rangeAttr = funcOp->getAttrOfType<DenseI64ArrayAttr>("vortex.user_arg_range")) {
+  SmallVector<unsigned> userArgIndices;
+
+  if (auto mappingAttr = funcOp->getAttrOfType<DenseI64ArrayAttr>("kernel_arg_mapping")) {
+    auto mapping = mappingAttr.asArrayRef();
+
+    // Find the max host arg index to determine host wrapper arg count
+    int64_t maxHostArg = -1;
+    for (int64_t idx : mapping) {
+      if (idx > maxHostArg) maxHostArg = idx;
+    }
+    unsigned hostArgCount = static_cast<unsigned>(maxHostArg + 1);
+
+    // User args are those in host wrapper positions 0...(hostArgCount - 3)
+    // Last 2 host args are gridDim and blockDim
+    unsigned userArgThreshold = (hostArgCount >= 2) ? hostArgCount - 2 : 0;
+
+    // Collect kernel arg indices that map to user args
+    // Use a set to track which host args we've already seen (for deduplication)
+    // When a host arg is used multiple times (e.g., as i32 and as index after index_cast),
+    // we only want to include it once in the user args.
+    llvm::SmallSet<int64_t, 8> seenHostArgs;
+    for (unsigned i = 0; i < mapping.size(); ++i) {
+      int64_t hostIdx = mapping[i];
+      if (hostIdx >= 0 && static_cast<unsigned>(hostIdx) < userArgThreshold) {
+        // Only include this kernel arg if we haven't seen this host arg yet
+        if (seenHostArgs.insert(hostIdx).second) {
+          userArgIndices.push_back(i);
+        }
+      }
+    }
+  } else if (auto rangeAttr = funcOp->getAttrOfType<DenseI64ArrayAttr>("vortex.user_arg_range")) {
+    // Fallback: use vortex.user_arg_range attribute from ReorderGPUKernelArgs pass
     auto range = rangeAttr.asArrayRef();
     if (range.size() == 2) {
-      userArgStart = static_cast<unsigned>(range[0]);
-      userArgCount = static_cast<unsigned>(range[1]);
+      unsigned start = static_cast<unsigned>(range[0]);
+      unsigned count = static_cast<unsigned>(range[1]);
+      for (unsigned i = 0; i < count; ++i) {
+        userArgIndices.push_back(start + i);
+      }
     }
   } else {
-    // Fallback: use old heuristic for backwards compatibility
-    // Count leading scalar args before any memrefs/pointers
-    unsigned numLeadingScalars = 0;
-    for (auto argType : argTypes) {
-      if (argType.isa<MemRefType>() || argType.isa<LLVM::LLVMPointerType>()) {
-        break;
-      }
-      ++numLeadingScalars;
+    // Final fallback: assume all args except last 2 are user args
+    unsigned userArgCount = (totalArgs >= 2) ? totalArgs - 2 : totalArgs;
+    for (unsigned i = 0; i < userArgCount; ++i) {
+      userArgIndices.push_back(i);
     }
-    // Skip first 2 leading scalars (derived from block_dim[0])
-    unsigned argsToSkip = (numLeadingScalars >= 2) ? 2 : 0;
-    userArgStart = argsToSkip;
-    userArgCount = totalArgs - argsToSkip;
   }
 
   unsigned offset = 0;
 
-  for (unsigned i = 0; i < userArgCount; ++i) {
-    unsigned argIndex = userArgStart + i;
+  for (unsigned i = 0; i < userArgIndices.size(); ++i) {
+    unsigned argIndex = userArgIndices[i];
     Type argType = argTypes[argIndex];
 
     KernelArgInfo argInfo;
