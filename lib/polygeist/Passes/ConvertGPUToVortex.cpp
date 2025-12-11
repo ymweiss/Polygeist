@@ -1118,6 +1118,12 @@ struct ConvertGPUToVortexPass
         // Skipped attributes: gpu.kernel, gpu.known_block_size, nvvm.*, rocdl.*
         // The kernel will use Vortex runtime conventions instead
 
+        // However, DO preserve kernel_arg_mapping - it's needed by GenerateVortexMain
+        // to identify synthetic arguments that need to be computed at runtime
+        if (auto mappingAttr = gpuFunc->getAttr("kernel_arg_mapping")) {
+          funcOp->setAttr("kernel_arg_mapping", mappingAttr);
+        }
+
         // Clone the function body
         IRMapping mapping;
         gpuFunc.getBody().cloneInto(&funcOp.getBody(), mapping);

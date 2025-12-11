@@ -21,6 +21,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 #include "polygeist/Passes/Passes.h"
+#include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include <limits>
@@ -114,9 +115,14 @@ static bool isMemrefDescriptorStart(LLVM::LLVMFunctionType funcType,
 /// This function unpacks arguments from the void* args pointer and calls
 /// the original kernel function
 ///
-/// IMPORTANT: Polygeist transforms kernel signatures to add computed arguments
-/// from the launch configuration. The first few kernel args may come from
-/// block_dim (e.g., block_dim.x as both index and i32), not from user args.
+/// Uses kernel_arg_mapping attribute to determine which args are user args
+/// vs launch config args (from block_dim). The mapping format:
+///   - Each entry corresponds to an original kernel arg (before LLVM expansion)
+///   - Value >= 0: index into host args (0=first user arg, 1=second, etc.)
+///   - Value = -1: synthetic arg (computed at launch time, e.g., comparisons)
+///
+/// Args with mapping value >= num_user_args are launch config params
+/// (typically block_dim.x as i32 and index types).
 ///
 /// This handles the memref descriptor expansion that happens during
 /// LLVM lowering. Each memref<?xf32> in the original kernel becomes 5 params
@@ -151,19 +157,12 @@ generateKernelBodyWrapper(ModuleOp module, LLVM::LLVMFuncOp kernelFunc,
 
   // Get kernel argument types
   auto kernelFuncType = kernelFunc.getFunctionType();
-  unsigned numArgs = kernelFuncType.getNumParams();
+  unsigned numParams = kernelFuncType.getNumParams();
 
-  // Standard Vortex args layout:
+  // Standard Vortex args layout (matches runtime/hip_vortex_runtime.h):
   //   uint32_t grid_dim[3];   // 12 bytes (offsets 0, 4, 8)
   //   uint32_t block_dim[3];  // 12 bytes (offsets 12, 16, 20)
   //   <user args>             // starting at offset 24
-  //
-  // IMPORTANT: Polygeist transforms kernel args during GPU lowering. The first
-  // two kernel args are typically derived from block_dim.x (threads_per_block):
-  //   arg0 = block_dim.x as i64 (index type)
-  //   arg1 = block_dim.x as i32
-  // These should be loaded from block_dim[0] in the header, not from user args.
-  // The remaining args (arg2+) come from the user args buffer.
   constexpr unsigned BLOCK_DIM_OFFSET = 12;
   constexpr unsigned USER_ARGS_OFFSET = 24;
 
@@ -171,22 +170,43 @@ generateKernelBodyWrapper(ModuleOp module, LLVM::LLVMFuncOp kernelFunc,
   unsigned currentOffset = USER_ARGS_OFFSET;
   auto i8Type = IntegerType::get(ctx, 8);
 
-  // Count leading scalar args before any memrefs/pointers
-  // These are typically derived from launch config (block_dim)
-  unsigned numLeadingScalars = 0;
-  for (unsigned i = 0; i < numArgs; ++i) {
-    Type argType = kernelFuncType.getParamType(i);
-    if (isMemrefDescriptorStart(kernelFuncType, i) ||
-        argType.isa<LLVM::LLVMPointerType>()) {
-      break;
+  // Parse kernel_arg_mapping attribute to understand which args are user args
+  // vs launch config (from block_dim)
+  SmallVector<int64_t> argMapping;
+  unsigned numUserArgs = 0;
+
+  if (auto mappingAttr = kernelFunc->getAttrOfType<DenseI64ArrayAttr>("kernel_arg_mapping")) {
+    argMapping = SmallVector<int64_t>(mappingAttr.asArrayRef());
+    // Determine numUserArgs by finding the boundary between user args and launch config
+    // User args have consecutive indices 0,1,2,3...
+    // Launch config args have indices that jump (e.g., index 5 when only 4 user args)
+    // We find the threshold by looking for gaps or the first repeated index
+    llvm::SmallSet<int64_t, 8> seenIndices;
+    int64_t maxIdx = -1;
+    for (int64_t idx : argMapping) {
+      if (idx >= 0) {
+        seenIndices.insert(idx);
+        if (idx > maxIdx) maxIdx = idx;
+      }
     }
-    ++numLeadingScalars;
+    // numUserArgs is the count of unique indices from 0 to maxIdx that exist
+    // If indices are 0,1,2,3,5,5 then unique set is {0,1,2,3,5}, so numUserArgs = 4 (not 6)
+    // because index 4 is missing, indicating indices >= 4 are launch config
+    numUserArgs = 0;
+    for (int64_t i = 0; i <= maxIdx; ++i) {
+      if (seenIndices.contains(i)) {
+        numUserArgs++;
+      } else {
+        // Gap found - everything before this is user args
+        break;
+      }
+    }
   }
 
-  // Pre-load block_dim[0] for the first two args (if needed)
+  // Pre-load block_dim[0] for launch config args
   Value blockDimX_i32 = nullptr;
   Value blockDimX_i64 = nullptr;
-  if (numLeadingScalars >= 2) {
+  {
     SmallVector<LLVM::GEPArg> gepIndices;
     gepIndices.push_back(static_cast<int32_t>(BLOCK_DIM_OFFSET));
     auto blockDimPtr =
@@ -195,7 +215,10 @@ generateKernelBodyWrapper(ModuleOp module, LLVM::LLVMFuncOp kernelFunc,
     blockDimX_i64 = builder.create<LLVM::ZExtOp>(loc, i64Type, blockDimX_i32);
   }
 
-  for (unsigned i = 0; i < numArgs; ) {
+  // Track which original args we've processed (for mapping lookup)
+  unsigned origArgIdx = 0;
+
+  for (unsigned i = 0; i < numParams; ) {
     Type argType = kernelFuncType.getParamType(i);
 
     // Check if this is the start of a memref descriptor (5 consecutive params)
@@ -230,16 +253,43 @@ generateKernelBodyWrapper(ModuleOp module, LLVM::LLVMFuncOp kernelFunc,
 
       currentOffset += 4; // Single pointer in args buffer
       i += 5;             // Skip 5 params (the whole memref descriptor)
+      origArgIdx++;       // Advance original arg index
       continue;
     }
 
     // Scalar argument handling
     Value argVal;
 
-    // First two leading scalars come from block_dim[0], not user args
-    // arg0 = block_dim.x as i64 (for index type in LLVM lowering)
-    // arg1 = block_dim.x as i32
-    if (i < 2 && numLeadingScalars >= 2) {
+    // Check if this is a launch config arg (from block_dim) or synthetic arg
+    bool isLaunchConfigArg = false;
+    bool isSyntheticArg = false;
+
+    if (origArgIdx < argMapping.size()) {
+      int64_t hostIdx = argMapping[origArgIdx];
+      if (hostIdx == -1) {
+        isSyntheticArg = true;
+      } else if (static_cast<unsigned>(hostIdx) >= numUserArgs) {
+        isLaunchConfigArg = true;
+      }
+    }
+
+    if (isSyntheticArg) {
+      // Synthetic args (mapping = -1) are computed at launch time
+      // For i1 args, this is typically a comparison result - use true as default
+      // For other types, use appropriate defaults
+      if (argType.isInteger(1)) {
+        // Boolean: default to true (common for bounds checks)
+        argVal = builder.create<LLVM::ConstantOp>(loc, argType, 1);
+      } else if (argType.isInteger(32)) {
+        argVal = builder.create<LLVM::ConstantOp>(loc, argType, 0);
+      } else if (argType.isInteger(64)) {
+        argVal = builder.create<LLVM::ConstantOp>(loc, argType, 0);
+      } else {
+        // Default: 0
+        argVal = builder.create<LLVM::ConstantOp>(loc, i32Type, 0);
+      }
+    } else if (isLaunchConfigArg) {
+      // Launch config arg - load from block_dim
       if (argType.isInteger(64)) {
         argVal = blockDimX_i64;
       } else {
@@ -271,6 +321,20 @@ generateKernelBodyWrapper(ModuleOp module, LLVM::LLVMFuncOp kernelFunc,
         auto f64Type = Float64Type::get(ctx);
         argVal = builder.create<LLVM::LoadOp>(loc, f64Type, argBytePtr);
         currentOffset += 8;
+      } else if (argType.isInteger(1)) {
+        // Boolean (i1): Load as i32, then truncate to i1
+        // In the args buffer, booleans are stored as 4-byte values
+        auto loadedVal = builder.create<LLVM::LoadOp>(loc, i32Type, argBytePtr);
+        argVal = builder.create<LLVM::TruncOp>(loc, argType, loadedVal);
+        currentOffset += 4;
+      } else if (argType.isInteger(8)) {
+        auto i8LoadType = IntegerType::get(ctx, 8);
+        argVal = builder.create<LLVM::LoadOp>(loc, i8LoadType, argBytePtr);
+        currentOffset += 1;
+      } else if (argType.isInteger(16)) {
+        auto i16Type = IntegerType::get(ctx, 16);
+        argVal = builder.create<LLVM::LoadOp>(loc, i16Type, argBytePtr);
+        currentOffset += 2;
       } else {
         // Default: treat as 4-byte value
         argVal = builder.create<LLVM::LoadOp>(loc, i32Type, argBytePtr);
@@ -280,6 +344,7 @@ generateKernelBodyWrapper(ModuleOp module, LLVM::LLVMFuncOp kernelFunc,
 
     unpackedArgs.push_back(argVal);
     ++i;
+    ++origArgIdx;
   }
 
   // Call the original kernel function
