@@ -276,6 +276,7 @@ generateKernelBodyWrapper(ModuleOp module, LLVM::LLVMFuncOp kernelFunc,
     if (isSyntheticArg) {
       // Synthetic args (mapping = -1) are computed at launch time
       // For i1 args, this is typically a comparison result - use true as default
+      // For pointer args, this is often a format string - find the global
       // For other types, use appropriate defaults
       if (argType.isInteger(1)) {
         // Boolean: default to true (common for bounds checks)
@@ -284,6 +285,25 @@ generateKernelBodyWrapper(ModuleOp module, LLVM::LLVMFuncOp kernelFunc,
         argVal = builder.create<LLVM::ConstantOp>(loc, argType, 0);
       } else if (argType.isInteger(64)) {
         argVal = builder.create<LLVM::ConstantOp>(loc, argType, 0);
+      } else if (argType.isa<LLVM::LLVMPointerType>()) {
+        // For pointer types (e.g., printf format strings), try to find a global
+        // string constant. Look for globals like @str0, @str1, etc.
+        LLVM::GlobalOp foundGlobal = nullptr;
+        module.walk([&](LLVM::GlobalOp globalOp) {
+          if (globalOp.getName().startswith("str")) {
+            foundGlobal = globalOp;
+            return WalkResult::interrupt();
+          }
+          return WalkResult::advance();
+        });
+
+        if (foundGlobal) {
+          argVal = builder.create<LLVM::AddressOfOp>(loc, ptrType, foundGlobal.getName());
+        } else {
+          // Fallback: create null pointer
+          auto nullVal = builder.create<LLVM::ZeroOp>(loc, ptrType);
+          argVal = nullVal;
+        }
       } else {
         // Default: 0
         argVal = builder.create<LLVM::ConstantOp>(loc, i32Type, 0);
