@@ -884,35 +884,44 @@ static void emitKernelMetadata(gpu::GPUFuncOp funcOp, StringRef outputDir) {
   StringRef baseName = extractBaseKernelName(funcOp.getName());
   meta.kernelName = baseName.str();
 
-  // Count leading scalar args before any memrefs/pointers
-  // These are typically derived from block_dim (e.g., block_dim.x)
-  // and should be skipped in user arg metadata since kernel_body
-  // derives them from the block_dim header, not user args.
   auto argTypes = funcOp.getArgumentTypes();
-  unsigned numLeadingScalars = 0;
-  for (auto argType : argTypes) {
-    if (argType.isa<MemRefType>() || argType.isa<LLVM::LLVMPointerType>()) {
-      break;
+  unsigned totalArgs = argTypes.size();
+
+  // Check for vortex.user_arg_range attribute from ReorderGPUKernelArgs pass
+  // Format: [start_index, count]
+  unsigned userArgStart = 0;
+  unsigned userArgCount = totalArgs;
+
+  if (auto rangeAttr = funcOp->getAttrOfType<DenseI64ArrayAttr>("vortex.user_arg_range")) {
+    auto range = rangeAttr.asArrayRef();
+    if (range.size() == 2) {
+      userArgStart = static_cast<unsigned>(range[0]);
+      userArgCount = static_cast<unsigned>(range[1]);
     }
-    ++numLeadingScalars;
+  } else {
+    // Fallback: use old heuristic for backwards compatibility
+    // Count leading scalar args before any memrefs/pointers
+    unsigned numLeadingScalars = 0;
+    for (auto argType : argTypes) {
+      if (argType.isa<MemRefType>() || argType.isa<LLVM::LLVMPointerType>()) {
+        break;
+      }
+      ++numLeadingScalars;
+    }
+    // Skip first 2 leading scalars (derived from block_dim[0])
+    unsigned argsToSkip = (numLeadingScalars >= 2) ? 2 : 0;
+    userArgStart = argsToSkip;
+    userArgCount = totalArgs - argsToSkip;
   }
 
-  // Skip first 2 leading scalars (derived from block_dim[0])
-  // These are: arg0 = block_dim.x as index, arg1 = block_dim.x as i32
-  unsigned argsToSkip = (numLeadingScalars >= 2) ? 2 : 0;
-
   unsigned offset = 0;
-  unsigned argIndex = 0;
 
-  for (auto argType : argTypes) {
-    if (argIndex < argsToSkip) {
-      // Skip this arg - it comes from block_dim header, not user args
-      argIndex++;
-      continue;
-    }
+  for (unsigned i = 0; i < userArgCount; ++i) {
+    unsigned argIndex = userArgStart + i;
+    Type argType = argTypes[argIndex];
 
     KernelArgInfo argInfo;
-    argInfo.name = "arg" + std::to_string(argIndex);
+    argInfo.name = "arg" + std::to_string(i);  // Renumber from 0
     argInfo.type = getMetadataTypeString(argType);
     argInfo.size = getTypeSizeRV32(argType);
     argInfo.offset = offset;
@@ -921,7 +930,6 @@ static void emitKernelMetadata(gpu::GPUFuncOp funcOp, StringRef outputDir) {
 
     meta.arguments.push_back(argInfo);
     offset += argInfo.size;
-    argIndex++;
   }
 
   meta.totalArgsSize = offset;

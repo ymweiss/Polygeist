@@ -71,6 +71,38 @@ static StringRef extractBaseKernelName(StringRef fullName) {
   return fullName;
 }
 
+/// Analyze gpu.launch_func to find which kernel args come from host wrapper args.
+/// Returns a vector where userArgMapping[kernel_arg_idx] = host_user_arg_idx if it's a user arg,
+/// or -1 if it's a synthetic/derived arg.
+///
+/// This works by tracing each kernel operand back to see if it's a BlockArgument
+/// from the host wrapper function.
+static std::vector<int> analyzeKernelArgsFromLaunch(
+    gpu::LaunchFuncOp launchOp,
+    func::FuncOp hostWrapper,
+    unsigned numHostUserArgs) {
+
+  auto kernelOperands = launchOp.getKernelOperands();
+  std::vector<int> userArgMapping(kernelOperands.size(), -1);
+
+  for (unsigned i = 0; i < kernelOperands.size(); ++i) {
+    Value operand = kernelOperands[i];
+
+    // Check if this operand is a BlockArgument from the host wrapper
+    if (auto blockArg = dyn_cast<BlockArgument>(operand)) {
+      if (blockArg.getOwner() == &hostWrapper.getBody().front()) {
+        unsigned argIdx = blockArg.getArgNumber();
+        // Only count if it's within user args (not blocks/threads params)
+        if (argIdx < numHostUserArgs) {
+          userArgMapping[i] = argIdx;
+        }
+      }
+    }
+  }
+
+  return userArgMapping;
+}
+
 /// Compute the permutation from device (Polygeist-reordered) to original order.
 /// Returns deviceToOriginal[device_idx] = original_idx
 static std::vector<unsigned> computeArgPermutation(
@@ -104,37 +136,49 @@ static std::vector<unsigned> computeArgPermutation(
 }
 
 /// Reorder GPU kernel arguments to match the original host wrapper order.
-/// Creates a new GPU function with arguments in original order and updates call sites.
+/// Uses launch_func analysis to correctly identify which args are user args vs synthetic.
+/// Creates a new GPU function with user arguments in original order and updates call sites.
 /// Returns true if reordering was performed.
-static bool reorderGPUKernelArguments(
+static bool reorderGPUKernelArgumentsV2(
     gpu::GPUModuleOp gpuModule,
     gpu::GPUFuncOp gpuFunc,
-    const std::vector<bool> &originalIsPointer,
+    func::FuncOp hostWrapper,
+    unsigned numHostUserArgs,
+    gpu::LaunchFuncOp launchOp,
     ModuleOp module) {
 
   auto argTypes = gpuFunc.getArgumentTypes();
+  unsigned numKernelArgs = argTypes.size();
 
-  // GPU kernel has internal args (index, i32) before user args
-  unsigned numLeadingScalars = 0;
-  for (auto argType : argTypes) {
-    if (argType.isa<MemRefType>() || argType.isa<LLVM::LLVMPointerType>())
-      break;
-    ++numLeadingScalars;
+  // Analyze launch_func to find which kernel args are user args
+  // userArgMapping[kernel_idx] = host_user_arg_idx, or -1 if synthetic
+  auto userArgMapping = analyzeKernelArgsFromLaunch(launchOp, hostWrapper, numHostUserArgs);
+
+  // Count user args and build mapping
+  std::vector<unsigned> userArgKernelIndices;  // kernel indices that are user args
+  std::vector<int> kernelToUserIdx(numKernelArgs, -1);  // kernel_idx -> index in userArgKernelIndices
+
+  for (unsigned i = 0; i < numKernelArgs; ++i) {
+    if (userArgMapping[i] >= 0) {
+      kernelToUserIdx[i] = userArgKernelIndices.size();
+      userArgKernelIndices.push_back(i);
+    }
   }
 
-  // Skip first 2 internal args (derived from block_dim)
-  unsigned argsToSkip = (numLeadingScalars >= 2) ? 2 : 0;
-  unsigned numUserArgs = argTypes.size() - argsToSkip;
-
-  if (numUserArgs != originalIsPointer.size()) {
-    llvm::errs() << "Warning: Argument count mismatch for reordering "
-                 << gpuFunc.getName() << " - expected " << originalIsPointer.size()
-                 << " user args, got " << numUserArgs << "\n";
+  unsigned numUserArgs = userArgKernelIndices.size();
+  if (numUserArgs != numHostUserArgs) {
+    llvm::errs() << "Warning: User arg count mismatch for " << gpuFunc.getName()
+                 << " - expected " << numHostUserArgs << ", found " << numUserArgs << "\n";
     return false;
   }
 
-  // Compute permutation: deviceToOriginal[device_idx] = original_idx
-  auto deviceToOriginal = computeArgPermutation(originalIsPointer);
+  // Build deviceToOriginal: for user args in kernel order, what's their original host order?
+  // deviceToOriginal[user_arg_index_in_kernel] = host_user_arg_index
+  std::vector<unsigned> deviceToOriginal(numUserArgs);
+  for (unsigned i = 0; i < numUserArgs; ++i) {
+    unsigned kernelIdx = userArgKernelIndices[i];
+    deviceToOriginal[i] = userArgMapping[kernelIdx];
+  }
 
   // Check if reordering is needed
   bool needsReorder = false;
@@ -145,23 +189,41 @@ static bool reorderGPUKernelArguments(
     }
   }
 
-  if (!needsReorder)
+  if (!needsReorder) {
+    llvm::outs() << "No reordering needed for: " << gpuFunc.getName() << "\n";
     return false;
+  }
 
-  // Compute inverse: originalToDevice[original_idx] = device_idx
+  // Compute inverse: originalToDevice[orig_idx] = device_user_idx
   std::vector<unsigned> originalToDevice(numUserArgs);
   for (unsigned devIdx = 0; devIdx < numUserArgs; ++devIdx) {
     originalToDevice[deviceToOriginal[devIdx]] = devIdx;
   }
 
-  // Build new argument types in original order
-  SmallVector<Type> newArgTypes;
-  for (unsigned i = 0; i < argsToSkip; ++i) {
-    newArgTypes.push_back(argTypes[i]);  // Keep internal args as-is
+  // Build new argument types: keep kernel structure but reorder user args in place
+  // We want user args in their original host order while keeping synthetic args
+  // in their relative positions.
+  SmallVector<Type> newArgTypes(numKernelArgs);
+  std::vector<int> oldIdxToNewIdx(numKernelArgs, -1);  // mapping for block arg reorder
+
+  // First, place synthetic args at their original positions
+  for (unsigned i = 0; i < numKernelArgs; ++i) {
+    if (userArgMapping[i] < 0) {
+      // Synthetic arg - keep in same position
+      newArgTypes[i] = argTypes[i];
+      oldIdxToNewIdx[i] = i;
+    }
   }
+
+  // Now place user args in their original host order, filling the remaining positions
+  // User args will be placed contiguously where the first user arg was
+  unsigned firstUserArgPos = userArgKernelIndices[0];
   for (unsigned origIdx = 0; origIdx < numUserArgs; ++origIdx) {
-    unsigned devIdx = originalToDevice[origIdx];
-    newArgTypes.push_back(argTypes[argsToSkip + devIdx]);
+    unsigned devUserIdx = originalToDevice[origIdx];
+    unsigned oldKernelIdx = userArgKernelIndices[devUserIdx];
+    unsigned newKernelIdx = firstUserArgPos + origIdx;
+    newArgTypes[newKernelIdx] = argTypes[oldKernelIdx];
+    oldIdxToNewIdx[oldKernelIdx] = newKernelIdx;
   }
 
   // Save the function name before any modifications
@@ -179,108 +241,60 @@ static bool reorderGPUKernelArguments(
   // Get the cloned function's entry block
   Block &clonedEntry = clonedFunc.getBody().front();
 
-  // The cloned function has arguments in device order.
-  // We need to permute them to original order.
-  //
-  // Current: [internal0, internal1, dev_user0, dev_user1, dev_user2, dev_user3]
-  // Desired: [internal0, internal1, orig_user0, orig_user1, orig_user2, orig_user3]
-  //
-  // where dev_user[i] has type for device position i
-  // and orig_user[i] should have type for original position i
-  //
-  // The body uses block args. We need to:
-  // 1. Create new block args in the right order
-  // 2. RAUW old block args with corresponding new ones
-  // 3. Erase old block args
-
-  // Step 1: Collect current block args and their types
+  // Collect current block args
   SmallVector<BlockArgument> currentArgs;
   for (auto arg : clonedEntry.getArguments()) {
     currentArgs.push_back(arg);
   }
 
-  // Step 2: For each position in the NEW signature, add a new block argument
-  // We'll add them at the end first, then reorder
-  SmallVector<BlockArgument> newInternalArgs;
-  SmallVector<BlockArgument> newUserArgs(numUserArgs);
-
-  // Add new arguments for internal args (these stay in same position)
-  for (unsigned i = 0; i < argsToSkip; ++i) {
-    // Internal args are unchanged, just use existing
-    newInternalArgs.push_back(currentArgs[i]);
-  }
-
-  // For user args, we need to add them in the NEW order (original order)
-  // and map old uses to new args
-  for (unsigned origIdx = 0; origIdx < numUserArgs; ++origIdx) {
-    unsigned devIdx = originalToDevice[origIdx];
-    // The type at original position origIdx should be the type from device position devIdx
-    Type argType = currentArgs[argsToSkip + devIdx].getType();
-    // Add a new argument at the end
+  // Add new arguments with the CORRECT types (from newArgTypes)
+  SmallVector<BlockArgument> newArgs(numKernelArgs);
+  for (unsigned newIdx = 0; newIdx < numKernelArgs; ++newIdx) {
+    Type argType = newArgTypes[newIdx];
     auto newArg = clonedEntry.addArgument(argType, clonedFunc.getLoc());
-    newUserArgs[origIdx] = newArg;
+    newArgs[newIdx] = newArg;
   }
 
-  // Step 3: RAUW - redirect uses of old args to new args
-  // Old arg at device position devIdx should be replaced with new arg at original position
-  // deviceToOriginal[devIdx] = origIdx means device pos devIdx came from original pos origIdx
-  // So uses of oldArg[argsToSkip + devIdx] should use newUserArgs[origIdx]
-  for (unsigned devIdx = 0; devIdx < numUserArgs; ++devIdx) {
-    unsigned origIdx = deviceToOriginal[devIdx];
-    currentArgs[argsToSkip + devIdx].replaceAllUsesWith(newUserArgs[origIdx]);
+  // RAUW old args with new args at their new positions
+  // oldIdxToNewIdx[oldIdx] = newIdx means old arg at oldIdx moves to newIdx
+  for (unsigned oldIdx = 0; oldIdx < numKernelArgs; ++oldIdx) {
+    unsigned newIdx = oldIdxToNewIdx[oldIdx];
+    currentArgs[oldIdx].replaceAllUsesWith(newArgs[newIdx]);
   }
 
-  // Step 4: Remove old user arguments (in reverse order to maintain indices)
-  for (int i = numUserArgs - 1; i >= 0; --i) {
-    clonedEntry.eraseArgument(argsToSkip + i);
+  // Remove old arguments (in reverse order)
+  for (int i = numKernelArgs - 1; i >= 0; --i) {
+    clonedEntry.eraseArgument(i);
   }
 
-  // Step 5: Update function type to match new signature
+  // Update function type
   clonedFunc.setFunctionType(FunctionType::get(gpuFunc.getContext(), newArgTypes, {}));
 
-  // Update all gpu.launch_func call sites to pass args in new order
-  // Collect launches to modify (can't modify while walking)
-  SmallVector<gpu::LaunchFuncOp> launchesToUpdate;
-  module.walk([&](gpu::LaunchFuncOp launchOp) {
-    auto callee = launchOp.getKernelAttr();
-    if (callee.getLeafReference() == funcNameStr)
-      launchesToUpdate.push_back(launchOp);
-  });
+  // Update launch_func operands
+  auto oldOperands = launchOp.getKernelOperands();
+  SmallVector<Value> newOperands(numKernelArgs);
 
-  for (auto launchOp : launchesToUpdate) {
-    auto oldOperands = launchOp.getKernelOperands();
-    if (oldOperands.size() != argTypes.size()) {
-      llvm::errs() << "Warning: Launch operand count mismatch\n";
-      continue;
-    }
-
-    // Build new operands in original order
-    SmallVector<Value> newOperands;
-    for (unsigned i = 0; i < argsToSkip; ++i) {
-      newOperands.push_back(oldOperands[i]);  // Keep internal args as-is
-    }
-    for (unsigned origIdx = 0; origIdx < numUserArgs; ++origIdx) {
-      unsigned devIdx = originalToDevice[origIdx];
-      newOperands.push_back(oldOperands[argsToSkip + devIdx]);
-    }
-
-    // Create new launch with temp function name
-    OpBuilder launchBuilder(launchOp);
-    auto newKernelAttr = SymbolRefAttr::get(
-        launchOp.getContext(),
-        launchOp.getKernelAttr().getRootReference(),
-        {FlatSymbolRefAttr::get(launchOp.getContext(), tempName)});
-
-    launchBuilder.create<gpu::LaunchFuncOp>(
-        launchOp.getLoc(),
-        newKernelAttr,
-        launchOp.getGridSizeOperandValues(),
-        launchOp.getBlockSizeOperandValues(),
-        launchOp.getDynamicSharedMemorySize(),
-        newOperands);
-
-    launchOp.erase();
+  // Build new operands matching new arg order
+  for (unsigned oldIdx = 0; oldIdx < numKernelArgs; ++oldIdx) {
+    newOperands[oldIdxToNewIdx[oldIdx]] = oldOperands[oldIdx];
   }
+
+  // Create new launch with temp function name
+  OpBuilder launchBuilder(launchOp);
+  auto newKernelAttr = SymbolRefAttr::get(
+      launchOp.getContext(),
+      launchOp.getKernelAttr().getRootReference(),
+      {FlatSymbolRefAttr::get(launchOp.getContext(), tempName)});
+
+  launchBuilder.create<gpu::LaunchFuncOp>(
+      launchOp.getLoc(),
+      newKernelAttr,
+      launchOp.getGridSizeOperandValues(),
+      launchOp.getBlockSizeOperandValues(),
+      launchOp.getDynamicSharedMemorySize(),
+      newOperands);
+
+  launchOp.erase();
 
   // Erase old function
   gpuFunc.erase();
@@ -289,18 +303,27 @@ static bool reorderGPUKernelArguments(
   clonedFunc.setName(funcNameStr);
 
   // Update all launch_func to use the final name
-  module.walk([&](gpu::LaunchFuncOp launchOp) {
-    auto callee = launchOp.getKernelAttr();
+  module.walk([&](gpu::LaunchFuncOp lop) {
+    auto callee = lop.getKernelAttr();
     if (callee.getLeafReference() == tempName) {
       auto newKernelAttr = SymbolRefAttr::get(
-          launchOp.getContext(),
+          lop.getContext(),
           callee.getRootReference(),
-          {FlatSymbolRefAttr::get(launchOp.getContext(), funcNameStr)});
-      launchOp.setKernelAttr(newKernelAttr);
+          {FlatSymbolRefAttr::get(lop.getContext(), funcNameStr)});
+      lop.setKernelAttr(newKernelAttr);
     }
   });
 
-  llvm::outs() << "Reordered kernel arguments: " << funcNameStr << "\n";
+  // Add attribute to mark user arg range for metadata generation
+  // User args are now at positions [firstUserArgPos, firstUserArgPos + numUserArgs)
+  SmallVector<int64_t> userArgRange = {
+    static_cast<int64_t>(firstUserArgPos),
+    static_cast<int64_t>(numUserArgs)
+  };
+  clonedFunc->setAttr("vortex.user_arg_range",
+      DenseI64ArrayAttr::get(clonedFunc.getContext(), userArgRange));
+
+  llvm::outs() << "Reordered kernel arguments (V2): " << funcNameStr << "\n";
   return true;
 }
 
@@ -320,11 +343,11 @@ struct ReorderGPUKernelArgsPass
   void runOnOperation() override {
     ModuleOp module = getOperation();
 
-    // Build argument order map from host wrapper functions
-    // This maps kernel base name -> list of (isPointer) for original args
-    llvm::StringMap<std::vector<bool>> originalArgIsPointer;
+    // Build map of host wrapper functions by name
+    // Maps base name (e.g. "__polygeist_launch_basic_kernel") -> func::FuncOp
+    llvm::StringMap<func::FuncOp> hostWrappers;
+    llvm::StringMap<unsigned> hostWrapperUserArgCount;
 
-    // Find host wrapper functions (func.func @__polygeist_launch_<name>)
     for (auto funcOp : module.getOps<func::FuncOp>()) {
       StringRef funcName = funcOp.getName();
       if (!funcName.startswith("__polygeist_launch_"))
@@ -334,32 +357,95 @@ struct ReorderGPUKernelArgsPass
       auto hostArgTypes = funcOp.getArgumentTypes();
       unsigned numHostUserArgs = hostArgTypes.size() > 2 ? hostArgTypes.size() - 2 : 0;
 
-      std::vector<bool> isPointerVec;
-      for (unsigned i = 0; i < numHostUserArgs; ++i) {
-        isPointerVec.push_back(hostArgTypes[i].isa<MemRefType>() ||
-                               hostArgTypes[i].isa<LLVM::LLVMPointerType>());
-      }
-      originalArgIsPointer[funcName] = std::move(isPointerVec);
+      hostWrappers[funcName] = funcOp;
+      hostWrapperUserArgCount[funcName] = numHostUserArgs;
     }
 
-    // Reorder GPU kernel arguments
+    // Find and process each kernel
+    // For each kernel, we need to find:
+    // 1. The gpu.func in the gpu.module
+    // 2. The gpu.launch_func that calls it
+    // 3. The host wrapper that contains the launch_func
+
     module.walk([&](gpu::GPUModuleOp gpuModule) {
-      // Collect kernels to reorder (can't modify while walking)
-      SmallVector<gpu::GPUFuncOp> kernelsToReorder;
+      // Collect kernels and their launches
+      struct KernelInfo {
+        gpu::GPUFuncOp gpuFunc;
+        gpu::LaunchFuncOp launchOp;
+        func::FuncOp hostWrapper;
+        unsigned numHostUserArgs;
+      };
+      SmallVector<KernelInfo> kernelsToProcess;
+
       for (auto gpuFunc : gpuModule.getOps<gpu::GPUFuncOp>()) {
-        if (gpuFunc.isKernel())
-          kernelsToReorder.push_back(gpuFunc);
+        if (!gpuFunc.isKernel())
+          continue;
+
+        std::string funcName = gpuFunc.getName().str();
+        std::string baseName = extractBaseKernelName(funcName).str();
+
+        // Find host wrapper
+        auto wrapperIt = hostWrappers.find(baseName);
+        if (wrapperIt == hostWrappers.end()) {
+          llvm::errs() << "Warning: No host wrapper found for " << funcName << "\n";
+          continue;
+        }
+
+        func::FuncOp hostWrapper = wrapperIt->second;
+        unsigned numHostUserArgs = hostWrapperUserArgCount[baseName];
+
+        // Find launch_func inside host wrapper that calls this kernel
+        gpu::LaunchFuncOp foundLaunch = nullptr;
+        hostWrapper.walk([&](gpu::LaunchFuncOp launchOp) {
+          if (launchOp.getKernelName().getValue() == funcName) {
+            foundLaunch = launchOp;
+            return WalkResult::interrupt();
+          }
+          return WalkResult::advance();
+        });
+
+        if (!foundLaunch) {
+          llvm::errs() << "Warning: No launch_func found for " << funcName << "\n";
+          continue;
+        }
+
+        kernelsToProcess.push_back({gpuFunc, foundLaunch, hostWrapper, numHostUserArgs});
       }
 
-      for (auto gpuFunc : kernelsToReorder) {
-        // Find base kernel name to look up original arg info
-        std::string baseName = extractBaseKernelName(gpuFunc.getName().str()).str();
+      // Process each kernel
+      for (auto &info : kernelsToProcess) {
+        reorderGPUKernelArgumentsV2(
+            gpuModule, info.gpuFunc, info.hostWrapper,
+            info.numHostUserArgs, info.launchOp, module);
+      }
 
-        // Look up original argument order
-        auto it = originalArgIsPointer.find(baseName);
-        if (it != originalArgIsPointer.end()) {
-          reorderGPUKernelArguments(gpuModule, gpuFunc, it->second, module);
+      // After all kernels are processed, collect the user arg ranges from
+      // the newly created kernel functions (the originals were erased)
+      SmallVector<NamedAttribute> kernelArgRanges;
+      for (auto gpuFunc : gpuModule.getOps<gpu::GPUFuncOp>()) {
+        if (auto rangeAttr = gpuFunc->getAttrOfType<DenseI64ArrayAttr>("vortex.user_arg_range")) {
+          kernelArgRanges.push_back(
+            NamedAttribute(
+              StringAttr::get(module.getContext(), gpuFunc.getName()),
+              rangeAttr
+            )
+          );
         }
+      }
+
+      // Add module-level attribute with all kernel arg ranges
+      if (!kernelArgRanges.empty()) {
+        // Get existing attribute or create new one
+        auto existingAttr = module->getAttrOfType<DictionaryAttr>("vortex.kernel_arg_ranges");
+        SmallVector<NamedAttribute> allRanges;
+        if (existingAttr) {
+          for (auto attr : existingAttr)
+            allRanges.push_back(attr);
+        }
+        for (auto &attr : kernelArgRanges)
+          allRanges.push_back(attr);
+        module->setAttr("vortex.kernel_arg_ranges",
+                        DictionaryAttr::get(module.getContext(), allRanges));
       }
     });
   }
