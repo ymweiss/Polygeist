@@ -279,6 +279,12 @@ generateKernelBodyWrapper(ModuleOp module, LLVM::LLVMFuncOp kernelFunc,
 
   for (unsigned i = 0; i < numArgs; ) {
     Type argType = kernelFuncType.getParamType(i);
+    if (isMemrefDescriptorStart(kernelFuncType, i) ||
+        argType.isa<LLVM::LLVMPointerType>()) {
+      break;
+    }
+    ++numLeadingScalars;
+  }
 
     // Check if this LLVM arg position is within the user arg range
     bool isUserArg = (mlirArgIdx >= userArgStartLLVM &&
