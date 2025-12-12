@@ -29,7 +29,8 @@ add_clang_executable(cgeist
   Lib/utils.cc
   Lib/IfScope.cc
   Lib/TypeUtils.cc
-  Lib/CGCall.cc 
+  Lib/CGCall.cc
+  Lib/HIPKernelAnalysis.cc
 )
 if(POLYGEIST_ENABLE_CUDA OR POLYGEIST_CUDA_FRONTEND_ONLY)
   target_compile_definitions(cgeist

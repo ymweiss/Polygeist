@@ -8,6 +8,7 @@
 
 #include "clang-mlir.h"
 #include "../ArgumentList.h"
+#include "HIPKernelAnalysis.h"
 #include "TypeUtils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/DLTI/DLTI.h"
@@ -66,6 +67,14 @@ cl::opt<bool> CStyleMemRef("c-style-memref", cl::init(true),
 static cl::opt<bool>
     CombinedStructABI("struct-abi", cl::init(true),
                       cl::desc("Use literal LLVM ABI for structs"));
+
+static cl::opt<bool>
+    DumpHIPKernels("dump-hip-kernels", cl::init(false),
+                   cl::desc("Dump discovered HIP/CUDA kernels and device functions"));
+
+static cl::opt<int>
+    VortexThreadsPerWarp("vortex-threads-per-warp", cl::init(0),
+                         cl::desc("Override warpSize with Vortex threads per warp (0 = use NVVM op)"));
 
 ValueCategory MLIRScanner::createComplexFloat(mlir::Location loc,
                                               mlir::Value real,
@@ -4091,6 +4100,13 @@ ValueCategory MLIRScanner::VisitCastExpr(CastExpr *E) {
       if (dr->getDecl()->getIdentifier() &&
           dr->getDecl()->getName() == "warpSize") {
         auto mlirType = getMLIRType(E->getType());
+        // For Vortex, use configurable threads per warp instead of NVVM op
+        if (VortexThreadsPerWarp > 0) {
+          return ValueCategory(
+              builder.create<arith::ConstantIntOp>(loc, VortexThreadsPerWarp,
+                                                   mlirType.cast<mlir::IntegerType>().getWidth()),
+              /*isReference*/ false);
+        }
         return ValueCategory(
             builder.create<mlir::NVVM::WarpSizeOp>(loc, mlirType),
             /*isReference*/ false);
@@ -5190,6 +5206,50 @@ MLIRASTConsumer::GetOrCreateMLIRFunction(const FunctionDecl *FD,
                       StringAttr::get(builder.getContext(), "1"));
   }
 
+  // Add kernel argument metadata for __global__ functions
+  if (FD->hasAttr<CUDAGlobalAttr>()) {
+    llvm::SmallVector<mlir::Attribute, 8> argAttrs;
+    unsigned offset = 0;
+
+    for (const clang::ParmVarDecl *param : FD->parameters()) {
+      clang::QualType paramType = param->getType();
+      clang::CharUnits size = astContext.getTypeSizeInChars(paramType);
+      clang::CharUnits align = astContext.getTypeAlignInChars(paramType);
+
+      // Compute aligned offset
+      unsigned alignVal = static_cast<unsigned>(align.getQuantity());
+      unsigned sizeVal = static_cast<unsigned>(size.getQuantity());
+      if (alignVal > 0) {
+        unsigned misalign = offset % alignVal;
+        if (misalign > 0)
+          offset += (alignVal - misalign);
+      }
+
+      bool isPtr = paramType->isPointerType() || paramType->isReferenceType() ||
+                   paramType->isArrayType();
+
+      llvm::SmallVector<mlir::NamedAttribute, 6> argDict;
+      argDict.push_back(builder.getNamedAttr(
+          "name", builder.getStringAttr(param->getNameAsString())));
+      argDict.push_back(builder.getNamedAttr(
+          "type", builder.getStringAttr(paramType.getAsString())));
+      argDict.push_back(builder.getNamedAttr(
+          "size", builder.getI32IntegerAttr(sizeVal)));
+      argDict.push_back(builder.getNamedAttr(
+          "align", builder.getI32IntegerAttr(alignVal)));
+      argDict.push_back(builder.getNamedAttr(
+          "offset", builder.getI32IntegerAttr(offset)));
+      argDict.push_back(builder.getNamedAttr(
+          "is_pointer", builder.getBoolAttr(isPtr)));
+
+      argAttrs.push_back(builder.getDictionaryAttr(argDict));
+      offset += sizeVal;
+    }
+
+    function->setAttr("vortex.kernel_args", builder.getArrayAttr(argAttrs));
+    function->setAttr("vortex.kernel_args_size", builder.getI32IntegerAttr(offset));
+  }
+
   if (LV == llvm::GlobalValue::InternalLinkage ||
       LV == llvm::GlobalValue::PrivateLinkage || !FD->isDefined() ||
       FD->hasAttr<CUDAGlobalAttr>() || FD->hasAttr<CUDADeviceAttr>()) {
@@ -5397,7 +5457,50 @@ bool MLIRASTConsumer::HandleTopLevelDecl(DeclGroupRef dg) {
 
 // Wait until Sema has instantiated all the relevant code
 // before running codegen on the selected functions.
-void MLIRASTConsumer::HandleTranslationUnit(ASTContext &C) { run(); }
+void MLIRASTConsumer::HandleTranslationUnit(ASTContext &C) {
+  // If requested, dump HIP/CUDA kernel information before processing
+  if (DumpHIPKernels) {
+    vortex::HIPKernelCollector collector(astContext, CGM);
+    collector.TraverseDecl(C.getTranslationUnitDecl());
+
+    llvm::outs() << "=== HIP/CUDA Kernel Analysis ===\n\n";
+
+    // Dump all kernels with full argument info
+    const auto &kernels = collector.getKernels();
+    llvm::outs() << "Kernels (" << kernels.size() << "):\n";
+    for (const auto &kernel : kernels) {
+      vortex::dumpKernelInfo(kernel, llvm::outs());
+      llvm::outs() << "\n";
+    }
+
+    // Dump all device functions
+    const auto &devFuncs = collector.getDeviceFunctions();
+    llvm::outs() << "Device Functions (" << devFuncs.size() << "):\n";
+    for (const auto &func : devFuncs) {
+      llvm::outs() << "  " << func.demangledName << " (";
+      switch (func.kind) {
+      case vortex::DeviceFunctionKind::Kernel:
+        llvm::outs() << "__global__";
+        break;
+      case vortex::DeviceFunctionKind::DeviceOnly:
+        llvm::outs() << "__device__";
+        break;
+      case vortex::DeviceFunctionKind::HostDevice:
+        llvm::outs() << "__host__ __device__";
+        break;
+      default:
+        llvm::outs() << "host";
+        break;
+      }
+      llvm::outs() << ")\n";
+      llvm::outs() << "    Mangled: " << func.mangledName << "\n";
+    }
+
+    llvm::outs() << "\n=== End Kernel Analysis ===\n";
+  }
+
+  run();
+}
 
 mlir::Location MLIRASTConsumer::getMLIRLocation(clang::SourceLocation loc) {
   auto spellingLoc = SM.getSpellingLoc(loc);
