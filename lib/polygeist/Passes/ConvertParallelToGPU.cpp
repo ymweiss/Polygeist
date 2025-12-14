@@ -44,6 +44,10 @@ static llvm::cl::opt<bool> GPUKernelEmitCoarsenedAlternatives(
     "gpu-kernel-emit-coarsened-alternatives", llvm::cl::init(false),
     llvm::cl::desc("Emit alternative kernels with coarsened threads"));
 
+static llvm::cl::opt<bool> VortexSingleKernel(
+    "vortex-single-kernel", llvm::cl::init(false),
+    llvm::cl::desc("Skip block-size alternatives for Vortex targets (emit single kernel)"));
+
 static llvm::cl::opt<bool> GPUKernelEnableBlockCoarsening(
     "gpu-kernel-enable-block-coarsening", llvm::cl::init(true),
     llvm::cl::desc("When emitting coarsened kernels, enable block coarsening"));
@@ -486,7 +490,16 @@ struct SplitParallelOp : public OpRewritePattern<polygeist::GPUWrapperOp> {
       }
     };
 
-    if (char *blockSizeStr = getenv("POLYGEIST_GPU_KERNEL_BLOCK_SIZE")) {
+    if (VortexSingleKernel) {
+      // Vortex single kernel mode: emit one kernel with a reasonable default block size
+      auto alternativesOp = rewriter.create<polygeist::AlternativesOp>(loc, 1);
+      alternativesOp->setAttr("alternatives.type",
+                              rewriter.getStringAttr("gpu_kernel"));
+      // Use 16 threads as default for Vortex (matches Vortex SimX config: NUM_WARPS=4 x NUM_THREADS=4)
+      emitAlternative(16, alternativesOp);
+      alternativesOp->setAttr("alternatives.descs",
+                              rewriter.getArrayAttr(descs));
+    } else if (char *blockSizeStr = getenv("POLYGEIST_GPU_KERNEL_BLOCK_SIZE")) {
       auto alternativesOp = rewriter.create<polygeist::AlternativesOp>(loc, 1);
       alternativesOp->setAttr("alternatives.type",
                               rewriter.getStringAttr("gpu_kernel"));
@@ -2247,8 +2260,10 @@ struct MergeGPUModulesPass
         };
 
         if (auto f = dyn_cast<gpu::GPUFuncOp>(&op)) {
+          // Check for collision BEFORE cloning
+          bool hasCollision = SymbolTable::lookupSymbolIn(newGpuModule, f.getName()) != nullptr;
           auto newF = cast<gpu::GPUFuncOp>(gpumBuilder.clone(op));
-          if (SymbolTable::lookupSymbolIn(newGpuModule, f.getName())) {
+          if (hasCollision) {
             auto newKernelName =
                 std::string(f.getName()) +
                 std::to_string(reinterpret_cast<intptr_t>(f.getOperation()));

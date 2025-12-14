@@ -5280,6 +5280,119 @@ MLIRASTConsumer::GetOrCreateMLIRFunction(const FunctionDecl *FD,
   return function;
 }
 
+mlir::func::FuncOp
+MLIRASTConsumer::getOrCreateLaunchWrapper(const FunctionDecl *kernelFD,
+                                           mlir::func::FuncOp kernelFunc) {
+  // Get the mangled kernel name (for wrapper function naming)
+  std::string kernelMangledName =
+      CGM.getMangledName(GlobalDecl(kernelFD, KernelReferenceKind::Kernel)).str();
+  std::string wrapperName = "__polygeist_launch_" + kernelMangledName;
+
+  // Get the unmangled kernel name (for binary naming - must match what hipLaunchKernelGGL macro sees)
+  std::string kernelName = kernelFD->getNameAsString();
+
+  // Check if wrapper already exists
+  auto it = launchWrappers.find(wrapperName);
+  if (it != launchWrappers.end()) {
+    return it->second;
+  }
+
+  mlir::OpBuilder builder(module->getContext());
+  auto loc = getMLIRLocation(kernelFD->getLocation());
+
+  // Build wrapper function type:
+  // (user_args..., gridX, gridY, gridZ, blockX, blockY, blockZ) -> void
+  SmallVector<mlir::Type, 16> wrapperArgTypes;
+
+  // Copy user argument types from kernel function
+  for (auto argType : kernelFunc.getArgumentTypes()) {
+    wrapperArgTypes.push_back(argType);
+  }
+
+  // Add 6 index types for grid and block dimensions
+  auto indexType = builder.getIndexType();
+  for (int i = 0; i < 6; ++i) {
+    wrapperArgTypes.push_back(indexType);
+  }
+
+  auto wrapperFuncType =
+      builder.getFunctionType(wrapperArgTypes, /*results=*/{});
+
+  // Create the wrapper function
+  auto wrapperFunc = mlir::func::FuncOp::create(loc, wrapperName, wrapperFuncType);
+
+  // Copy vortex.kernel_args attribute from kernel to wrapper
+  if (auto kernelArgsAttr = kernelFunc->getAttr("vortex.kernel_args")) {
+    wrapperFunc->setAttr("vortex.kernel_args", kernelArgsAttr);
+  }
+  if (auto kernelArgsSizeAttr = kernelFunc->getAttr("vortex.kernel_args_size")) {
+    wrapperFunc->setAttr("vortex.kernel_args_size", kernelArgsSizeAttr);
+  }
+
+  // Set linkage and visibility
+  SymbolTable::setSymbolVisibility(wrapperFunc, SymbolTable::Visibility::Private);
+  NamedAttrList attrs(wrapperFunc->getAttrDictionary());
+  attrs.set("llvm.linkage",
+            mlir::LLVM::LinkageAttr::get(builder.getContext(),
+                                          mlir::LLVM::Linkage::Internal));
+  wrapperFunc->setAttrs(attrs.getDictionary(builder.getContext()));
+
+  // Create entry block with arguments
+  auto *entryBlock = wrapperFunc.addEntryBlock();
+  builder.setInsertionPointToStart(entryBlock);
+
+  // Get wrapper arguments
+  unsigned numUserArgs = kernelFunc.getNumArguments();
+  auto wrapperArgs = entryBlock->getArguments();
+
+  // User args are the first numUserArgs arguments
+  SmallVector<mlir::Value, 8> userArgs;
+  for (unsigned i = 0; i < numUserArgs; ++i) {
+    userArgs.push_back(wrapperArgs[i]);
+  }
+
+  // Grid and block dimensions are the last 6 arguments
+  mlir::Value gridX = wrapperArgs[numUserArgs + 0];
+  mlir::Value gridY = wrapperArgs[numUserArgs + 1];
+  mlir::Value gridZ = wrapperArgs[numUserArgs + 2];
+  mlir::Value blockX = wrapperArgs[numUserArgs + 3];
+  mlir::Value blockY = wrapperArgs[numUserArgs + 4];
+  mlir::Value blockZ = wrapperArgs[numUserArgs + 5];
+
+  // Create gpu.launch operation
+  auto launchOp = builder.create<mlir::gpu::LaunchOp>(
+      loc, gridX, gridY, gridZ, blockX, blockY, blockZ,
+      /*dynamicSharedMemorySize=*/nullptr,
+      /*tokenType=*/nullptr,
+      /*asyncDependencies=*/ValueRange{});
+
+  // Copy vortex metadata to the gpu.launch operation so it gets copied
+  // to the outlined gpu.func by the kernel outlining pass
+  if (auto kernelArgsAttr = kernelFunc->getAttr("vortex.kernel_args")) {
+    launchOp->setAttr("vortex.kernel_args", kernelArgsAttr);
+  }
+  if (auto kernelArgsSizeAttr = kernelFunc->getAttr("vortex.kernel_args_size")) {
+    launchOp->setAttr("vortex.kernel_args_size", kernelArgsSizeAttr);
+  }
+  // Also store the kernel name for reference
+  launchOp->setAttr("vortex.kernel_name", builder.getStringAttr(kernelName));
+
+  // Inside the launch region, call the kernel function
+  builder.setInsertionPointToStart(&launchOp.getRegion().front());
+  builder.create<mlir::func::CallOp>(loc, kernelFunc, userArgs);
+  builder.create<mlir::gpu::TerminatorOp>(loc);
+
+  // Add return to wrapper function
+  builder.setInsertionPointToEnd(entryBlock);
+  builder.create<mlir::func::ReturnOp>(loc);
+
+  // Add wrapper to module and cache
+  module->push_back(wrapperFunc);
+  launchWrappers[wrapperName] = wrapperFunc;
+
+  return wrapperFunc;
+}
+
 void MLIRASTConsumer::run() {
   while (functionsToEmit.size()) {
     const FunctionDecl *FD = functionsToEmit.front();

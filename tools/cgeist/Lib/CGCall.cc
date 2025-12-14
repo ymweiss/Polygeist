@@ -254,6 +254,7 @@ ValueCategory MLIRScanner::CallHelper(
   }
 
   if (auto *CU = dyn_cast<CUDAKernelCallExpr>(expr)) {
+    // Extract grid dimensions from kernel launch config
     auto l0 = Visit(CU->getConfig()->getArg(0));
     assert(l0.isReference);
     mlir::Value blocks[3];
@@ -290,6 +291,7 @@ ValueCategory MLIRScanner::CallHelper(
       }
     }
 
+    // Extract block dimensions from kernel launch config
     auto t0 = Visit(CU->getConfig()->getArg(1));
     assert(t0.isReference);
     mlir::Value threads[3];
@@ -325,6 +327,12 @@ ValueCategory MLIRScanner::CallHelper(
                     val, idx)));
       }
     }
+
+    // Get the kernel FunctionDecl from the call expression
+    const FunctionDecl *kernelFD = CU->getDirectCallee();
+
+    // Create gpu.launch operation directly with Vortex metadata attached
+    // The metadata will be copied to the outlined gpu.func by the kernel outlining pass
     mlir::Value stream = nullptr;
     SmallVector<mlir::Value, 1> asyncDependencies;
     if (3 < CU->getConfig()->getNumArgs() &&
@@ -341,6 +349,21 @@ ValueCategory MLIRScanner::CallHelper(
         /*dynamic shmem size*/ nullptr,
         /*token type*/ stream ? stream.getType() : nullptr,
         /*dependencies*/ asyncDependencies);
+
+    // If this is a __global__ kernel, attach Vortex metadata for argument marshalling
+    if (kernelFD && kernelFD->hasAttr<CUDAGlobalAttr>()) {
+      // Copy vortex metadata from the kernel function to the gpu.launch operation
+      if (auto kernelArgsAttr = tocall->getAttr("vortex.kernel_args")) {
+        op->setAttr("vortex.kernel_args", kernelArgsAttr);
+      }
+      if (auto kernelArgsSizeAttr = tocall->getAttr("vortex.kernel_args_size")) {
+        op->setAttr("vortex.kernel_args_size", kernelArgsSizeAttr);
+      }
+      // Store the unmangled kernel name - this must match what hipLaunchKernelGGL macro sees
+      std::string kernelName = kernelFD->getNameAsString();
+      op->setAttr("vortex.kernel_name", builder.getStringAttr(kernelName));
+    }
+
     auto oldpoint = builder.getInsertionPoint();
     auto *oldblock = builder.getInsertionBlock();
     builder.setInsertionPointToStart(&op.getRegion().front());
