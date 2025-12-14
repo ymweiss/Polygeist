@@ -72,6 +72,10 @@ static cl::opt<bool>
     DumpHIPKernels("dump-hip-kernels", cl::init(false),
                    cl::desc("Dump discovered HIP/CUDA kernels and device functions"));
 
+static cl::opt<bool>
+    EmitVortexWrappers("emit-vortex-wrappers", cl::init(false),
+                       cl::desc("Auto-generate __polygeist_launch_* wrappers for all kernels"));
+
 static cl::opt<int>
     VortexThreadsPerWarp("vortex-threads-per-warp", cl::init(0),
                          cl::desc("Override warpSize with Vortex threads per warp (0 = use NVVM op)"));
@@ -292,11 +296,17 @@ void MLIRScanner::init(mlir::func::FuncOp function, const FunctionDecl *fd) {
   auto loc = getMLIRLocation(fd->getBeginLoc());
   if (fd->hasAttr<CUDAGlobalAttr>() && Glob.CGM.getLangOpts().CUDA &&
       !Glob.CGM.getLangOpts().CUDAIsDevice) {
-    auto deviceStub =
-        Glob.GetOrCreateMLIRFunction(fd, /* getDeviceStub */ true);
-    builder.create<func::CallOp>(loc, deviceStub, function.getArguments());
-    builder.create<func::ReturnOp>(loc);
-    return;
+    // When emit-vortex-wrappers is set, we want to emit the kernel body
+    // inside a gpu.launch region. Skip the normal stub approach.
+    if (!EmitVortexWrappers) {
+      auto deviceStub =
+          Glob.GetOrCreateMLIRFunction(fd, /* getDeviceStub */ true);
+      builder.create<func::CallOp>(loc, deviceStub, function.getArguments());
+      builder.create<func::ReturnOp>(loc);
+      return;
+    }
+    // Otherwise fall through to emit the kernel body as GPU code
+    // The kernel body will be emitted in the wrapper created by HandleTranslationUnit
   }
 
   if (auto CC = dyn_cast<CXXConstructorDecl>(fd)) {
@@ -5291,10 +5301,25 @@ MLIRASTConsumer::getOrCreateLaunchWrapper(const FunctionDecl *kernelFD,
   // Get the unmangled kernel name (for binary naming - must match what hipLaunchKernelGGL macro sees)
   std::string kernelName = kernelFD->getNameAsString();
 
-  // Check if wrapper already exists
+  // Check if wrapper already exists (in cache or in functions map)
   auto it = launchWrappers.find(wrapperName);
   if (it != launchWrappers.end()) {
     return it->second;
+  }
+
+  // Also check functions map (wrapper may have been created from source)
+  auto funcIt = functions.find(wrapperName);
+  if (funcIt != functions.end()) {
+    launchWrappers[wrapperName] = funcIt->second;
+    return funcIt->second;
+  }
+
+  // Check if symbol already exists in module (could be from other processing)
+  if (auto existingOp = mlir::SymbolTable::lookupSymbolIn(module.get(), wrapperName)) {
+    if (auto existingFunc = dyn_cast<mlir::func::FuncOp>(existingOp)) {
+      launchWrappers[wrapperName] = existingFunc;
+      return existingFunc;
+    }
   }
 
   mlir::OpBuilder builder(module->getContext());
@@ -5613,6 +5638,45 @@ void MLIRASTConsumer::HandleTranslationUnit(ASTContext &C) {
   }
 
   run();
+
+  // Auto-generate launch wrappers for all kernels if requested
+  // This must happen AFTER run() so that kernel MLIR functions exist
+  // Only generate wrappers in DEVICE mode where the actual kernel function exists
+  if (EmitVortexWrappers) {
+    bool isDeviceMode = CGM.getLangOpts().CUDAIsDevice;
+
+    // Skip wrapper generation in host mode - the kernel func doesn't exist there
+    if (!isDeviceMode) {
+      llvm::errs() << "Skipping Vortex wrapper generation in host mode\n";
+    } else {
+      vortex::HIPKernelCollector collector(astContext, CGM);
+      collector.TraverseDecl(C.getTranslationUnitDecl());
+
+      const auto &kernels = collector.getKernels();
+      llvm::outs() << "Generating Vortex launch wrappers for " << kernels.size()
+                   << " kernel(s)...\n";
+
+      for (const auto &kernel : kernels) {
+        // Look up the MLIR function by regular mangled name
+        // Note: kernel.mangledName uses KernelReferenceKind::Kernel mangling, but
+        // functions are registered with regular mangling (without kernel reference kind)
+        std::string regularMangledName = CGM.getMangledName(kernel.decl).str();
+        auto it = functions.find(regularMangledName);
+        if (it == functions.end()) {
+          llvm::errs() << "Warning: MLIR function not found for kernel "
+                       << kernel.demangledName << " (mangled: "
+                       << regularMangledName << ")\n";
+          continue;
+        }
+
+        mlir::func::FuncOp kernelFunc = it->second;
+
+        // Generate the launch wrapper
+        auto wrapperFunc = getOrCreateLaunchWrapper(kernel.decl, kernelFunc);
+        llvm::outs() << "  Created wrapper: " << wrapperFunc.getName().str() << "\n";
+      }
+    } // end else (device mode)
+  }
 }
 
 mlir::Location MLIRASTConsumer::getMLIRLocation(clang::SourceLocation loc) {
