@@ -76,6 +76,10 @@ static cl::opt<bool>
     EmitVortexWrappers("emit-vortex-wrappers", cl::init(false),
                        cl::desc("Auto-generate __polygeist_launch_* wrappers for all kernels"));
 
+static cl::opt<bool>
+    EmitHostFunctions("emit-host-functions", cl::init(false),
+                      cl::desc("Also emit host-only functions (like main) in CUDA device mode"));
+
 static cl::opt<int>
     VortexThreadsPerWarp("vortex-threads-per-warp", cl::init(0),
                          cl::desc("Override warpSize with Vortex threads per warp (0 = use NVVM op)"));
@@ -5122,6 +5126,16 @@ MLIRASTConsumer::GetOrCreateMLIRFunction(const FunctionDecl *FD,
       function->setAttrs(attrs.getDictionary(builder.getContext()));
       functionsToEmit.push_back(Def);
     }
+    // Mark host-only functions when in device mode (early exit path)
+    if (EmitHostFunctions && CGM.getLangOpts().CUDAIsDevice) {
+      bool hasDeviceAttr = FD->hasAttr<CUDADeviceAttr>() ||
+                          FD->hasAttr<CUDAGlobalAttr>();
+      if (!hasDeviceAttr && !function->hasAttr("polygeist.host_only_func")) {
+        mlir::OpBuilder builder(module->getContext());
+        function->setAttr("polygeist.host_only_func",
+                          StringAttr::get(builder.getContext(), "1"));
+      }
+    }
     assert(function->getParentOp() == module.get());
     return function;
   }
@@ -5214,6 +5228,17 @@ MLIRASTConsumer::GetOrCreateMLIRFunction(const FunctionDecl *FD,
       !FD->hasAttr<CUDAHostAttr>()) {
     function->setAttr("polygeist.device_only_func",
                       StringAttr::get(builder.getContext(), "1"));
+  }
+
+  // Mark host-only functions when --emit-host-functions is used
+  // A function is host-only if it doesn't have __device__ or __global__ attributes
+  if (EmitHostFunctions && CGM.getLangOpts().CUDAIsDevice) {
+    bool hasDeviceAttr = FD->hasAttr<CUDADeviceAttr>() ||
+                        FD->hasAttr<CUDAGlobalAttr>();
+    if (!hasDeviceAttr) {
+      function->setAttr("polygeist.host_only_func",
+                        StringAttr::get(builder.getContext(), "1"));
+    }
   }
 
   // Add kernel argument metadata for __global__ functions
@@ -5476,14 +5501,31 @@ void MLIRASTConsumer::HandleDeclContext(DeclContext *DC) {
     }
 
     bool externLinkage = true;
+    bool isHostOnlyFunc = false;
     /*
     auto LV = CGM.getFunctionLinkage(fd);
     if (LV == llvm::GlobalValue::InternalLinkage || LV ==
     llvm::GlobalValue::PrivateLinkage) externLinkage = false; if
     (fd->isInlineSpecified()) externLinkage = false;
     */
-    if (!CGM.getContext().DeclMustBeEmitted(fd))
-      externLinkage = false;
+    if (!CGM.getContext().DeclMustBeEmitted(fd)) {
+      // In CUDA device mode, DeclMustBeEmitted returns false for host-only
+      // functions. If --emit-host-functions is set, we still want to emit them.
+      if (EmitHostFunctions && CGM.getLangOpts().CUDAIsDevice) {
+        // Check if this is a host-only function (no __device__ or __global__)
+        bool hasDeviceAttr = fd->hasAttr<CUDADeviceAttr>() ||
+                            fd->hasAttr<CUDAGlobalAttr>();
+        if (!hasDeviceAttr) {
+          // This is a host-only function - mark it for emission
+          isHostOnlyFunc = true;
+          // Keep externLinkage true so it gets emitted
+        } else {
+          externLinkage = false;
+        }
+      } else {
+        externLinkage = false;
+      }
+    }
 
     std::string name;
     if (auto CC = dyn_cast<CXXConstructorDecl>(fd))
@@ -5551,14 +5593,32 @@ bool MLIRASTConsumer::HandleTopLevelDecl(DeclGroupRef dg) {
     }
 
     bool externLinkage = true;
+    bool isHostOnlyFunc = false;
+    bool isCUDADevice = CGM.getLangOpts().CUDAIsDevice;
     /*
     auto LV = CGM.getFunctionLinkage(fd);
     if (LV == llvm::GlobalValue::InternalLinkage || LV ==
     llvm::GlobalValue::PrivateLinkage) externLinkage = false; if
     (fd->isInlineSpecified()) externLinkage = false;
     */
-    if (!CGM.getContext().DeclMustBeEmitted(fd))
-      externLinkage = false;
+    if (!CGM.getContext().DeclMustBeEmitted(fd)) {
+      // In CUDA device mode, DeclMustBeEmitted returns false for host-only
+      // functions. If --emit-host-functions is set, we still want to emit them.
+      if (EmitHostFunctions && isCUDADevice) {
+        // Check if this is a host-only function (no __device__ or __global__)
+        bool hasDeviceAttr = fd->hasAttr<CUDADeviceAttr>() ||
+                            fd->hasAttr<CUDAGlobalAttr>();
+        if (!hasDeviceAttr) {
+          // This is a host-only function - mark it for emission
+          isHostOnlyFunc = true;
+          // Keep externLinkage true so it gets emitted
+        } else {
+          externLinkage = false;
+        }
+      } else {
+        externLinkage = false;
+      }
+    }
 
     std::string name;
     if (auto CC = dyn_cast<CXXConstructorDecl>(fd))
@@ -5586,6 +5646,23 @@ bool MLIRASTConsumer::HandleTopLevelDecl(DeclGroupRef dg) {
          externLinkage) ||
         emitIfFound.count(name)) {
       functionsToEmit.push_back(fd);
+      // Mark host-only functions with attribute when in device mode
+      if (EmitHostFunctions && isCUDADevice) {
+        bool hasDeviceAttr = fd->hasAttr<CUDADeviceAttr>() ||
+                            fd->hasAttr<CUDAGlobalAttr>();
+        if (!hasDeviceAttr) {
+          // Look up the existing function and mark it
+          auto it = functions.find(name);
+          if (it != functions.end()) {
+            auto function = it->second;
+            if (!function->hasAttr("polygeist.host_only_func")) {
+              mlir::OpBuilder builder(module->getContext());
+              function->setAttr("polygeist.host_only_func",
+                                StringAttr::get(builder.getContext(), "1"));
+            }
+          }
+        }
+      }
     } else {
     }
   }
