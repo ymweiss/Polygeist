@@ -974,39 +974,29 @@ static void emitKernelMetadata(gpu::GPUFuncOp funcOp, StringRef outputDir) {
 
   // Use kernel_arg_mapping attribute to identify user args
   // The mapping tells us which host wrapper arg each kernel arg came from.
-  // Host wrapper signature is: (user_args..., gridDim, blockDim)
-  // So any kernel arg that maps to host arg index < (total_host_args - 2) is a user arg.
+  // Host wrapper args are ALL user arguments - grid/block dims are passed via <<<>>> syntax.
+  // Kernel may have additional synthetic args (e.g., loop bounds) that Polygeist generates,
+  // which are identified by having duplicate mappings (same host arg used for multiple kernel args).
   SmallVector<unsigned> userArgIndices;
 
   if (auto mappingAttr = funcOp->getAttrOfType<DenseI64ArrayAttr>("kernel_arg_mapping")) {
     auto mapping = mappingAttr.asArrayRef();
 
-    // Find the max host arg index to determine host wrapper arg count
-    int64_t maxHostArg = -1;
-    for (int64_t idx : mapping) {
-      if (idx > maxHostArg) maxHostArg = idx;
-    }
-    unsigned hostArgCount = static_cast<unsigned>(maxHostArg + 1);
-
-    // User args are those in host wrapper positions 0...(hostArgCount - 3)
-    // Last 2 host args are gridDim and blockDim
-    unsigned userArgThreshold = (hostArgCount >= 2) ? hostArgCount - 2 : 0;
-
-    // Collect kernel arg indices that map to user args
+    // Collect kernel arg indices that map to unique host args
     // Use a set to track which host args we've already seen (for deduplication)
+    // Duplicate mappings indicate synthetic args that should be skipped
     llvm::SmallSet<int64_t, 8> seenHostArgs;
     for (unsigned i = 0; i < mapping.size(); ++i) {
       int64_t hostIdx = mapping[i];
-      if (hostIdx >= 0 && static_cast<unsigned>(hostIdx) < userArgThreshold) {
+      if (hostIdx >= 0) {
         if (seenHostArgs.insert(hostIdx).second) {
           userArgIndices.push_back(i);
         }
       }
     }
   } else {
-    // Fallback: assume all args except last 2 are user args
-    unsigned userArgCount = (totalArgs >= 2) ? totalArgs - 2 : totalArgs;
-    for (unsigned i = 0; i < userArgCount; ++i) {
+    // Fallback: assume all args are user args
+    for (unsigned i = 0; i < totalArgs; ++i) {
       userArgIndices.push_back(i);
     }
   }
