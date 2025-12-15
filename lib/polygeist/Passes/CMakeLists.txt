@@ -22,6 +22,7 @@ add_mlir_dialect_library(MLIRPolygeistTransforms
   ReorderGPUKernelArgs.cpp
   GenerateVortexMain.cpp
   InsertVortexDivergence.cpp
+  ConvertGPULaunchToHostCall.cpp
   SerializeToCubin.cpp
   SerializeToHsaco.cpp
   ParallelLoopUnroll.cpp

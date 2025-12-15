@@ -415,4 +415,36 @@ def InsertVortexDivergence : Pass<"insert-vortex-divergence", "ModuleOp"> {
   ];
 }
 
+def ConvertGPULaunchToHostCall : Pass<"convert-gpu-launch-to-host-call", "ModuleOp"> {
+  let summary = "Convert gpu.launch_func to host-side runtime calls";
+  let description = [{
+    This pass converts gpu.launch_func operations in HOST functions to calls
+    to the Vortex HIP runtime. This is used to compile host launch wrappers
+    as a native library that can be linked with the host application.
+
+    The pass transforms:
+      gpu.launch_func @kernel blocks in (%gx, %gy, %gz) threads in (%bx, %by, %bz)
+        args(%ptr0 : memref<?xf32>, %ptr1 : memref<?xf32>, %n : i32)
+
+    Into:
+      %addr0 = llvm.call @hip_ptr_to_device_addr(%ptr0)
+      %addr1 = llvm.call @hip_ptr_to_device_addr(%ptr1)
+      // Build Vortex args buffer: grid + block + [addr0, addr1, n]
+      llvm.call @vortex_launch_with_args("kernel", %args_buffer, %size)
+
+    This allows compiling the launch wrapper to x86_64 host code that calls
+    the HIP runtime, instead of generating C header stubs.
+
+    Note: This pass should be used for HOST compilation, not device compilation.
+    For device compilation, use --convert-gpu-to-vortex instead.
+  }];
+  let constructor = "mlir::polygeist::createConvertGPULaunchToHostCallPass()";
+  let dependentDialects = [
+    "LLVM::LLVMDialect",
+    "gpu::GPUDialect",
+    "memref::MemRefDialect",
+    "func::FuncDialect",
+  ];
+}
+
 #endif // POLYGEIST_PASSES
