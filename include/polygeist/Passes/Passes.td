@@ -447,4 +447,30 @@ def ConvertGPULaunchToHostCall : Pass<"convert-gpu-launch-to-host-call", "Module
   ];
 }
 
+def StripHostOnlyFunctions : Pass<"strip-host-only-functions", "ModuleOp"> {
+  let summary = "Remove functions marked with polygeist.host_only_func attribute";
+  let description = [{
+    This pass removes host-only functions from the module before lowering to
+    device code. Functions with the polygeist.host_only_func="1" attribute
+    are erased.
+
+    This is used in conjunction with cgeist's --emit-host-functions flag, which
+    emits both host and device functions but marks host-only functions with
+    the polygeist.host_only_func attribute. This pass then strips out the
+    host-only functions before the device compilation pipeline.
+
+    Example usage:
+      cgeist input.hip --emit-host-functions ... -o gpu.mlir
+      polygeist-opt gpu.mlir --convert-gpu-to-vortex --strip-host-only-functions ...
+
+    The pass handles both func.func and llvm.func operations, so it can be
+    run before or after LLVM lowering.
+  }];
+  let constructor = "mlir::polygeist::createStripHostOnlyFunctionsPass()";
+  let dependentDialects = [
+    "func::FuncDialect",
+    "LLVM::LLVMDialect",
+  ];
+}
+
 #endif // POLYGEIST_PASSES

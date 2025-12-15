@@ -84,6 +84,7 @@ std::unique_ptr<Pass> createConvertGPUToVortexPass();
 std::unique_ptr<Pass> createGenerateVortexMainPass();
 std::unique_ptr<Pass> createInsertVortexDivergencePass();
 std::unique_ptr<Pass> createConvertGPULaunchToHostCallPass();
+std::unique_ptr<Pass> createStripHostOnlyFunctionsPass();
 
 void populateForBreakToWhilePatterns(RewritePatternSet &patterns);
 } // namespace polygeist
