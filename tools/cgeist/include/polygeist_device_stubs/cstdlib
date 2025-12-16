@@ -1,0 +1,110 @@
+// Polygeist device stub for <cstdlib>
+// This stub prevents __float128 errors from GCC's libstdc++ during device compilation.
+
+#ifndef __POLYGEIST_DEVICE_STUBS_CSTDLIB
+#define __POLYGEIST_DEVICE_STUBS_CSTDLIB
+
+#ifdef __CUDA__
+// During device compilation (cgeist with --emit-cuda):
+// Provide complete stdlib declarations to avoid pulling in GCC headers
+// which contain __float128 in abs() overloads.
+
+#include <cstddef>  // For size_t, NULL
+
+// Constants
+#ifndef RAND_MAX
+#define RAND_MAX 2147483647
+#endif
+
+#ifndef EXIT_SUCCESS
+#define EXIT_SUCCESS 0
+#endif
+
+#ifndef EXIT_FAILURE
+#define EXIT_FAILURE 1
+#endif
+
+extern "C" {
+  // String conversion functions
+  int atoi(const char* str);
+  long atol(const char* str);
+  long long atoll(const char* str);
+  double atof(const char* str);
+  double strtod(const char* str, char** endptr);
+  float strtof(const char* str, char** endptr);
+  long double strtold(const char* str, char** endptr);
+  long strtol(const char* str, char** endptr, int base);
+  unsigned long strtoul(const char* str, char** endptr, int base);
+  long long strtoll(const char* str, char** endptr, int base);
+  unsigned long long strtoull(const char* str, char** endptr, int base);
+
+  // Memory allocation
+  void* malloc(size_t size);
+  void* calloc(size_t nmemb, size_t size);
+  void* realloc(void* ptr, size_t size);
+  void free(void* ptr);
+  void* aligned_alloc(size_t alignment, size_t size);
+
+  // Process control
+  void exit(int status);
+  void _Exit(int status);
+  void abort(void);
+  int atexit(void (*func)(void));
+
+  // Random numbers
+  int rand(void);
+  void srand(unsigned int seed);
+
+  // Integer arithmetic (C versions)
+  int abs(int n);
+  long labs(long n);
+  long long llabs(long long n);
+
+  // Sorting and searching
+  void qsort(void* base, size_t nmemb, size_t size,
+             int (*compar)(const void*, const void*));
+  void* bsearch(const void* key, const void* base, size_t nmemb, size_t size,
+                int (*compar)(const void*, const void*));
+
+  // Environment
+  char* getenv(const char* name);
+  int system(const char* command);
+}
+
+namespace std {
+  using ::size_t;
+  using ::atoi;
+  using ::atol;
+  using ::atoll;
+  using ::atof;
+  using ::strtod;
+  using ::strtof;
+  using ::strtold;
+  using ::strtol;
+  using ::strtoul;
+  using ::strtoll;
+  using ::strtoull;
+  using ::malloc;
+  using ::calloc;
+  using ::realloc;
+  using ::free;
+  using ::exit;
+  using ::abort;
+  using ::atexit;
+  using ::rand;
+  using ::srand;
+  using ::abs;   // C abs(int) from <stdlib.h>
+  using ::labs;
+  using ::llabs;
+  using ::qsort;
+  using ::bsearch;
+  using ::getenv;
+  using ::system;
+}
+
+#else
+// Pure host compilation (not cgeist): include the real header
+#include_next <cstdlib>
+#endif
+
+#endif // __POLYGEIST_DEVICE_STUBS_CSTDLIB

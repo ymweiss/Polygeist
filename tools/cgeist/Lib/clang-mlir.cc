@@ -6184,6 +6184,10 @@ mlir::Type MLIRASTConsumer::getMLIRType(clang::QualType qt, bool *implicitRef,
     if (auto IT = dyn_cast<llvm::IntegerType>(T)) {
       return builder.getIntegerType(IT->getBitWidth());
     }
+    // Handle nullptr_t and other pointer builtin types
+    if (T->isPointerTy()) {
+      return typeTranslator.translateType(T);
+    }
   }
   qt->dump();
   llvm_unreachable("unhandled type");
@@ -6276,6 +6280,42 @@ mlir::Value MLIRScanner::getTypeAlign(mlir::Location loc, clang::QualType t) {
 }
 
 #include "clang/Frontend/TextDiagnosticBuffer.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Path.h"
+
+// Extern declaration for GetExecutablePath from driver.cc
+extern std::string GetExecutablePath(const char *Argv0, bool CanonicalPrefixes);
+
+/// Get the path to polygeist_device_stubs directory for intercepting
+/// problematic STL headers during CUDA/HIP device compilation.
+static std::string getPolygeistDeviceStubsPath(const char *Argv0) {
+  void *GetExecutablePathVP = (void *)(intptr_t)GetExecutablePath;
+  std::string ExePath =
+      llvm::sys::fs::getMainExecutable(Argv0, GetExecutablePathVP);
+  llvm::SmallString<256> Path(llvm::sys::path::parent_path(ExePath));
+
+  // Try: <bin>/../include/polygeist_device_stubs (installed location)
+  llvm::sys::path::append(Path, "..", "include");
+  llvm::sys::path::append(Path, "polygeist_device_stubs");
+  if (llvm::sys::fs::exists(Path))
+    return std::string(Path);
+
+  // Try: <bin>/include/polygeist_device_stubs (build directory)
+  Path = llvm::sys::path::parent_path(ExePath);
+  llvm::sys::path::append(Path, "include", "polygeist_device_stubs");
+  if (llvm::sys::fs::exists(Path))
+    return std::string(Path);
+
+  // Try: <source>/tools/cgeist/include/polygeist_device_stubs (source tree)
+  Path = llvm::sys::path::parent_path(ExePath);
+  llvm::sys::path::append(Path, "..", "..");
+  llvm::sys::path::append(Path, "tools", "cgeist");
+  llvm::sys::path::append(Path, "include", "polygeist_device_stubs");
+  if (llvm::sys::fs::exists(Path))
+    return std::string(Path);
+
+  return "";
+}
 
 static bool parseMLIR(const char *Argv0, std::vector<std::string> filenames,
                       std::string fn, std::vector<std::string> includeDirs,
@@ -6326,6 +6366,9 @@ static bool parseMLIR(const char *Argv0, std::vector<std::string> filenames,
   if (SysRoot != "") {
     Argv.push_back("--sysroot");
     Argv.emplace_back(SysRoot);
+  }
+  if (StdLib != "") {
+    Argv.emplace_back("-stdlib=", StdLib);
   }
   if (Verbose) {
     Argv.push_back("-v");
@@ -6425,6 +6468,24 @@ static bool parseMLIR(const char *Argv0, std::vector<std::string> filenames,
     Clang->getTarget().adjust(Clang->getDiagnostics(), Clang->getLangOpts());
 
     llvm::Triple jobTriple = Clang->getTarget().getTriple();
+
+    // For GPU compilation jobs, add polygeist device stubs to intercept
+    // problematic headers (like <iostream>, <stdio.h>) that use __float128.
+    // Device code doesn't need these headers, so we provide stubs.
+    if (jobTriple.isNVPTX() || jobTriple.isAMDGCN() || jobTriple.isAMDGPU()) {
+      std::string StubPath = getPolygeistDeviceStubsPath(Argv0);
+      if (!StubPath.empty()) {
+        // Insert at beginning of UserEntries to get highest priority
+        // This ensures stubs are searched before system headers
+        // Use System (not CXXSystem) to catch both C and C++ includes
+        auto &HSOpts = Clang->getHeaderSearchOpts();
+        HSOpts.UserEntries.insert(
+            HSOpts.UserEntries.begin(),
+            clang::HeaderSearchOptions::Entry(
+                StubPath, clang::frontend::System,
+                /*IsFramework=*/false, /*IgnoreSysRoot=*/true));
+      }
+    }
     if (triple.str() == "" || !jobTriple.isNVPTX()) {
       triple = jobTriple;
       module.get()->setAttr(

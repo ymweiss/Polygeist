@@ -59,6 +59,16 @@ EXPORT PolygeistTargets
 RUNTIME DESTINATION ${LLVM_TOOLS_INSTALL_DIR}
 COMPONENT cgeist)
 
+# Install polygeist device stub headers for CUDA/HIP compilation
+# These stubs intercept problematic STL headers during device compilation
+install(DIRECTORY include/polygeist_device_stubs
+        DESTINATION include
+        COMPONENT cgeist)
+
+# Copy stubs to build directory for development/testing
+file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/include/polygeist_device_stubs"
+     DESTINATION "${CMAKE_CURRENT_BINARY_DIR}/include")
+
 target_include_directories(cgeist PRIVATE
   "${LLVM_SOURCE_DIR}/../clang/include"
   "${CMAKE_BINARY_DIR}/tools/clang/include"

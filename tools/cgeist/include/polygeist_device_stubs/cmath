@@ -1,0 +1,152 @@
+// Polygeist device stub for <cmath>
+// This stub prevents __float128 errors from GCC's libstdc++ during device compilation.
+
+#ifndef __POLYGEIST_DEVICE_STUBS_CMATH
+#define __POLYGEIST_DEVICE_STUBS_CMATH
+
+#ifdef __CUDA__
+// During device compilation (cgeist with --emit-cuda):
+// Provide math function declarations without __float128 overloads
+
+#include <cstddef>
+
+extern "C" {
+  // Trigonometric functions
+  double sin(double x);
+  double cos(double x);
+  double tan(double x);
+  double asin(double x);
+  double acos(double x);
+  double atan(double x);
+  double atan2(double y, double x);
+
+  float sinf(float x);
+  float cosf(float x);
+  float tanf(float x);
+  float asinf(float x);
+  float acosf(float x);
+  float atanf(float x);
+  float atan2f(float y, float x);
+
+  // Hyperbolic functions
+  double sinh(double x);
+  double cosh(double x);
+  double tanh(double x);
+  float sinhf(float x);
+  float coshf(float x);
+  float tanhf(float x);
+
+  // Exponential and logarithmic functions
+  double exp(double x);
+  double exp2(double x);
+  double log(double x);
+  double log2(double x);
+  double log10(double x);
+  float expf(float x);
+  float exp2f(float x);
+  float logf(float x);
+  float log2f(float x);
+  float log10f(float x);
+
+  // Power functions
+  double pow(double base, double exp);
+  double sqrt(double x);
+  double cbrt(double x);
+  double hypot(double x, double y);
+  float powf(float base, float exp);
+  float sqrtf(float x);
+  float cbrtf(float x);
+  float hypotf(float x, float y);
+
+  // Rounding functions
+  double ceil(double x);
+  double floor(double x);
+  double round(double x);
+  double trunc(double x);
+  float ceilf(float x);
+  float floorf(float x);
+  float roundf(float x);
+  float truncf(float x);
+
+  // Absolute value
+  double fabs(double x);
+  float fabsf(float x);
+
+  // Min/max
+  double fmin(double x, double y);
+  double fmax(double x, double y);
+  float fminf(float x, float y);
+  float fmaxf(float x, float y);
+
+  // Other
+  double fmod(double x, double y);
+  double remainder(double x, double y);
+  float fmodf(float x, float y);
+  float remainderf(float x, float y);
+
+  int isnan(double x);
+  int isinf(double x);
+  int isfinite(double x);
+}
+
+namespace std {
+  using ::sin;
+  using ::cos;
+  using ::tan;
+  using ::asin;
+  using ::acos;
+  using ::atan;
+  using ::atan2;
+  using ::sinh;
+  using ::cosh;
+  using ::tanh;
+  using ::exp;
+  using ::exp2;
+  using ::log;
+  using ::log2;
+  using ::log10;
+  using ::pow;
+  using ::sqrt;
+  using ::cbrt;
+  using ::ceil;
+  using ::floor;
+  using ::round;
+  using ::trunc;
+  using ::fabs;
+  using ::fmin;
+  using ::fmax;
+  using ::fmod;
+
+  // Float overloads for C++ style
+  inline float sin(float x) { return sinf(x); }
+  inline float cos(float x) { return cosf(x); }
+  inline float tan(float x) { return tanf(x); }
+  inline float asin(float x) { return asinf(x); }
+  inline float acos(float x) { return acosf(x); }
+  inline float atan(float x) { return atanf(x); }
+  inline float atan2(float y, float x) { return atan2f(y, x); }
+  inline float exp(float x) { return expf(x); }
+  inline float log(float x) { return logf(x); }
+  inline float log10(float x) { return log10f(x); }
+  inline float pow(float base, float e) { return powf(base, e); }
+  inline float sqrt(float x) { return sqrtf(x); }
+  inline float ceil(float x) { return ceilf(x); }
+  inline float floor(float x) { return floorf(x); }
+  inline float round(float x) { return roundf(x); }
+  inline float trunc(float x) { return truncf(x); }
+  inline float fabs(float x) { return fabsf(x); }
+  inline float fmin(float x, float y) { return fminf(x, y); }
+  inline float fmax(float x, float y) { return fmaxf(x, y); }
+  inline float fmod(float x, float y) { return fmodf(x, y); }
+
+  // abs for float/double (using fabs)
+  inline float abs(float x) { return fabsf(x); }
+  inline double abs(double x) { return ::fabs(x); }
+}
+
+#else
+// Pure host compilation (not cgeist): include the real header
+#include_next <cmath>
+#endif
+
+#endif // __POLYGEIST_DEVICE_STUBS_CMATH

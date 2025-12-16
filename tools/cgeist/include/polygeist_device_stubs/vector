@@ -1,0 +1,61 @@
+/*===-- vector - Polygeist device stub for <vector> -----------------------===*\
+|*                                                                            *|
+|* Part of the Polygeist Project, under the Apache License v2.0               *|
+|* See https://llvm.org/LICENSE.txt for license information.                  *|
+|*                                                                            *|
+|* This stub provides minimal declarations during CUDA/HIP device             *|
+|* compilation to allow host code to parse without errors.                    *|
+|*                                                                            *|
+\*===----------------------------------------------------------------------===*/
+
+#ifndef __POLYGEIST_DEVICE_STUBS_VECTOR
+#define __POLYGEIST_DEVICE_STUBS_VECTOR
+
+#ifdef __CUDA_ARCH__
+// Device compilation: provide minimal stub that allows parsing
+#include <cstddef>
+
+namespace std {
+  template<typename T, typename Alloc = void*>
+  class vector {
+  public:
+    using value_type = T;
+    using size_type = size_t;
+    using reference = T&;
+    using const_reference = const T&;
+    using pointer = T*;
+    using const_pointer = const T*;
+    using iterator = T*;
+    using const_iterator = const T*;
+
+    vector() {}
+    explicit vector(size_type) {}
+    vector(size_type, const T&) {}
+    vector(const vector&) {}
+    ~vector() {}
+
+    vector& operator=(const vector&) { return *this; }
+    reference operator[](size_type) { static T t; return t; }
+    const_reference operator[](size_type) const { static T t; return t; }
+
+    T* data() { return nullptr; }
+    const T* data() const { return nullptr; }
+    size_type size() const { return 0; }
+    bool empty() const { return true; }
+    void push_back(const T&) {}
+    void clear() {}
+    void resize(size_type) {}
+
+    iterator begin() { return nullptr; }
+    iterator end() { return nullptr; }
+    const_iterator begin() const { return nullptr; }
+    const_iterator end() const { return nullptr; }
+  };
+}
+
+#else
+// Host compilation: include the real header
+#include_next <vector>
+#endif
+
+#endif // __POLYGEIST_DEVICE_STUBS_VECTOR

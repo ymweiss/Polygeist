@@ -1,0 +1,21 @@
+/*===-- sstream - Polygeist device stub for <sstream> ---------------------===*\
+|*                                                                            *|
+|* Part of the Polygeist Project, under the Apache License v2.0               *|
+|* See https://llvm.org/LICENSE.txt for license information.                  *|
+|*                                                                            *|
+|* This stub header provides an empty replacement for <sstream> during        *|
+|* CUDA/HIP device compilation. Device code does not use string streams.      *|
+|*                                                                            *|
+\*===----------------------------------------------------------------------===*/
+
+#ifndef __POLYGEIST_DEVICE_STUBS_SSTREAM
+#define __POLYGEIST_DEVICE_STUBS_SSTREAM
+
+#ifdef __CUDA_ARCH__
+// Device compilation: empty stub (device code doesn't use sstream)
+#else
+// Host compilation: include the real header
+#include_next <sstream>
+#endif
+
+#endif // __POLYGEIST_DEVICE_STUBS_SSTREAM
