@@ -1169,6 +1169,50 @@ struct ConvertGPUToVortexPass
       }
     }
 
+    // Extract kernel dimension from gpu.launch_func and set as attribute on kernel
+    // This determines whether vx_spawn_threads uses 1D, 2D, or 3D dispatch
+    // Dimension is determined by checking if gridSizeY/Z are constant 1
+    module.walk([&](gpu::LaunchFuncOp launchOp) {
+      // Find the corresponding gpu.func
+      auto kernelSymbol = launchOp.getKernel();
+      auto gpuModule = module.lookupSymbol<gpu::GPUModuleOp>(
+          kernelSymbol.getRootReference());
+      if (!gpuModule)
+        return;
+      auto gpuFunc = gpuModule.lookupSymbol<gpu::GPUFuncOp>(
+          kernelSymbol.getLeafReference());
+      if (!gpuFunc || gpuFunc->hasAttr("vortex.kernel_dimension"))
+        return;  // Already processed or not found
+
+      // Determine dimension from grid sizes
+      // 1D: gridSizeY == 1 && gridSizeZ == 1
+      // 2D: gridSizeZ == 1
+      // 3D: otherwise
+      unsigned dimension = 3;  // Default to 3D
+
+      auto isConstantOne = [](Value v) -> bool {
+        if (auto constOp = v.getDefiningOp<arith::ConstantOp>()) {
+          if (auto intAttr = constOp.getValue().dyn_cast<IntegerAttr>()) {
+            return intAttr.getInt() == 1;
+          }
+        }
+        return false;
+      };
+
+      bool gridYIsOne = isConstantOne(launchOp.getGridSizeY());
+      bool gridZIsOne = isConstantOne(launchOp.getGridSizeZ());
+
+      if (gridYIsOne && gridZIsOne) {
+        dimension = 1;
+      } else if (gridZIsOne) {
+        dimension = 2;
+      }
+
+      // Set dimension attribute on the kernel function
+      auto dimAttr = IntegerAttr::get(IntegerType::get(context, 32), dimension);
+      gpuFunc->setAttr("vortex.kernel_dimension", dimAttr);
+    });
+
     // Remove gpu.launch_func operations - they were needed for Polygeist
     // to generate proper MLIR but are not needed for Vortex kernel compilation.
     // The host code handles kernel launching through the Vortex runtime separately.
@@ -1214,6 +1258,11 @@ struct ConvertGPUToVortexPass
         // to identify synthetic arguments that need to be computed at runtime
         if (auto mappingAttr = gpuFunc->getAttr("kernel_arg_mapping")) {
           funcOp->setAttr("kernel_arg_mapping", mappingAttr);
+        }
+
+        // Preserve kernel dimension (1D, 2D, 3D) for vx_spawn_threads
+        if (auto dimAttr = gpuFunc->getAttr("vortex.kernel_dimension")) {
+          funcOp->setAttr("vortex.kernel_dimension", dimAttr);
         }
 
         // Clone the function body

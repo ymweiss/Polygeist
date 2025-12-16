@@ -381,9 +381,11 @@ generateKernelBodyWrapper(ModuleOp module, LLVM::LLVMFuncOp kernelFunc,
 /// 1. Reads args from VX_CSR_MSCRATCH via inline assembly
 /// 2. Extracts grid_dim pointer from args struct
 /// 3. Calls vx_spawn_threads() with kernel_body callback
+/// @param dimension 1, 2, or 3 for grid/block dimensionality
 static LLVM::LLVMFuncOp generateMainFunction(ModuleOp module,
                                               LLVM::LLVMFuncOp bodyFunc,
                                               LLVM::LLVMFuncOp spawnFunc,
+                                              unsigned dimension,
                                               OpBuilder &builder) {
   MLIRContext *ctx = module.getContext();
   Location loc = module.getLoc();
@@ -440,10 +442,9 @@ static LLVM::LLVMFuncOp generateMainFunction(ModuleOp module,
   // 4. Get kernel_body function pointer
   auto kernelPtr = builder.create<LLVM::AddressOfOp>(loc, ptrType, bodyFunc.getName());
 
-  // 5. Call vx_spawn_threads(dimension=1, grid_dim, block_dim, kernel_body, args)
-  // dimension=1 for 1D grid (most common case)
-  // TODO: Support multi-dimensional grids by reading dimension from metadata
-  auto dim = builder.create<LLVM::ConstantOp>(loc, i32Type, 1);
+  // 5. Call vx_spawn_threads(dimension, grid_dim, block_dim, kernel_body, args)
+  // dimension is 1, 2, or 3 for 1D/2D/3D grids (read from vortex.kernel_dimension attr)
+  auto dim = builder.create<LLVM::ConstantOp>(loc, i32Type, dimension);
 
   SmallVector<Value> spawnArgs = {dim, gridDimPtr, blockDimPtr, kernelPtr,
                                    argsPtr};
@@ -491,8 +492,15 @@ struct GenerateVortexMainPass
     // 4. Generate kernel_body wrapper
     auto bodyFunc = generateKernelBodyWrapper(module, kernelFunc, builder);
 
-    // 5. Generate main() entry point
-    generateMainFunction(module, bodyFunc, spawnFunc, builder);
+    // 5. Read dimension from kernel function attribute (default to 1 for backward compatibility)
+    // Dimension is set by ConvertGPUToVortex pass based on grid sizes
+    unsigned dimension = 1;
+    if (auto dimAttr = kernelFunc->getAttrOfType<IntegerAttr>("vortex.kernel_dimension")) {
+      dimension = dimAttr.getInt();
+    }
+
+    // 6. Generate main() entry point
+    generateMainFunction(module, bodyFunc, spawnFunc, dimension, builder);
   }
 };
 
