@@ -974,21 +974,39 @@ static void emitKernelMetadata(gpu::GPUFuncOp funcOp, StringRef outputDir) {
 
   // Use kernel_arg_mapping attribute to identify user args
   // The mapping tells us which host wrapper arg each kernel arg came from.
-  // Host wrapper args are ALL user arguments - grid/block dims are passed via <<<>>> syntax.
-  // Kernel may have additional synthetic args (e.g., loop bounds) that Polygeist generates,
-  // which are identified by having duplicate mappings (same host arg used for multiple kernel args).
+  // Host wrapper signature is: (user_arg0, user_arg1, ..., __blocks, __threads)
+  // The last 2 host args are grid/block dimensions, NOT user args.
+  // Kernel may have synthetic args (e.g., iteration count) that are derived from dims.
+  // These are identified by:
+  //   1. Duplicate mappings (same host arg used for multiple kernel args)
+  //   2. Mapping to the last 2 host args (dim parameters)
   SmallVector<unsigned> userArgIndices;
 
   if (auto mappingAttr = funcOp->getAttrOfType<DenseI64ArrayAttr>("kernel_arg_mapping")) {
     auto mapping = mappingAttr.asArrayRef();
 
-    // Collect kernel arg indices that map to unique host args
-    // Use a set to track which host args we've already seen (for deduplication)
-    // Duplicate mappings indicate synthetic args that should be skipped
+    // Find the maximum host arg index to determine dim arg boundary
+    // Host wrapper args: 0 to maxHostIdx, where:
+    //   - args 0 to maxHostIdx-2 are user args
+    //   - args maxHostIdx-1 and maxHostIdx are __blocks and __threads
+    int64_t maxHostIdx = -1;
+    for (int64_t idx : mapping) {
+      if (idx > maxHostIdx) maxHostIdx = idx;
+    }
+
+    // User args are those with hostIdx <= maxHostIdx - 2
+    // (excludes the last 2 host args which are __blocks, __threads)
+    int64_t maxUserArgIdx = maxHostIdx - 2;
+
+    // Collect kernel arg indices that map to unique USER host args
     llvm::SmallSet<int64_t, 8> seenHostArgs;
     for (unsigned i = 0; i < mapping.size(); ++i) {
       int64_t hostIdx = mapping[i];
-      if (hostIdx >= 0) {
+      // Only include args that:
+      // 1. Have valid host mapping (>= 0)
+      // 2. Map to user args (not dim args)
+      // 3. Haven't been seen yet (deduplication)
+      if (hostIdx >= 0 && hostIdx <= maxUserArgIdx) {
         if (seenHostArgs.insert(hostIdx).second) {
           userArgIndices.push_back(i);
         }
