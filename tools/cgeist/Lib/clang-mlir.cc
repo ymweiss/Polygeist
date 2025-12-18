@@ -9,6 +9,7 @@
 #include "clang-mlir.h"
 #include "../ArgumentList.h"
 #include "HIPKernelAnalysis.h"
+#include "HIPSourceTransform.h"
 #include "TypeUtils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/DLTI/DLTI.h"
@@ -83,6 +84,18 @@ static cl::opt<bool>
 static cl::opt<int>
     VortexThreadsPerWarp("vortex-threads-per-warp", cl::init(0),
                          cl::desc("Override warpSize with Vortex threads per warp (0 = use NVVM op)"));
+
+static cl::opt<bool>
+    TransformHIPSource("transform-hip-source", cl::init(false),
+                       cl::desc("Transform HIP source to add launch wrapper functions"));
+
+static cl::opt<std::string>
+    TransformOutput("transform-output", cl::init(""),
+                    cl::desc("Output file for transformed HIP source (requires --transform-hip-source)"));
+
+static cl::opt<bool>
+    TransformOnly("transform-only", cl::init(false),
+                  cl::desc("Only perform HIP source transformation, then exit"));
 
 ValueCategory MLIRScanner::createComplexFloat(mlir::Location loc,
                                               mlir::Value real,
@@ -5673,6 +5686,36 @@ bool MLIRASTConsumer::HandleTopLevelDecl(DeclGroupRef dg) {
 // Wait until Sema has instantiated all the relevant code
 // before running codegen on the selected functions.
 void MLIRASTConsumer::HandleTranslationUnit(ASTContext &C) {
+  // If requested, transform HIP source to add launch wrapper functions
+  // With --transform-only, this just writes the transformed source and exits
+  if (TransformHIPSource) {
+    vortex::HIPSourceTransformer transformer(C, SM, C.getLangOpts());
+    bool transformed = transformer.transform(C.getTranslationUnitDecl());
+
+    if (transformed) {
+      std::string outputPath = TransformOutput.getValue();
+      if (outputPath.empty()) {
+        // Default to a temp file if no output specified
+        outputPath = "/tmp/transformed_hip_source.cu";
+      }
+
+      if (transformer.writeToFile(outputPath)) {
+        llvm::outs() << "[HIPSourceTransform] Successfully wrote transformed source to: "
+                     << outputPath << "\n";
+      } else {
+        llvm::errs() << "[HIPSourceTransform] Failed to write transformed source\n";
+      }
+    } else {
+      llvm::errs() << "[HIPSourceTransform] No transformations applied\n";
+    }
+
+    // If --transform-only is set, exit after writing transformed source
+    if (TransformOnly) {
+      llvm::outs() << "[HIPSourceTransform] --transform-only: exiting after transformation\n";
+      return;  // Skip the rest of codegen
+    }
+  }
+
   // If requested, dump HIP/CUDA kernel information before processing
   if (DumpHIPKernels) {
     vortex::HIPKernelCollector collector(astContext, CGM);
