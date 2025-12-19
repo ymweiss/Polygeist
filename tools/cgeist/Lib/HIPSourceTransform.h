@@ -71,6 +71,10 @@ public:
   /// Write transformed source to a file
   bool writeToFile(llvm::StringRef filename) const;
 
+  /// Generate and write host stub header file (_args.h)
+  /// This generates the stub with correct argument order directly from AST
+  bool writeStubHeader(llvm::StringRef outputDir) const;
+
   /// Get collected kernel information
   const std::vector<KernelInfo> &getKernels() const { return kernels; }
 
@@ -85,6 +89,7 @@ private:
   std::vector<KernelInfo> kernels;
   std::vector<LaunchSiteInfo> launchSites;
   std::map<std::string, bool> wrappersGenerated;  // Track which wrappers we've generated
+  std::map<std::string, bool> kernelsNeedingConversion;  // Track kernels that need blockIdx→threadIdx
 
   /// Analyze a kernel function
   KernelInfo analyzeKernel(const clang::FunctionDecl *FD);
@@ -120,6 +125,12 @@ private:
 
   /// Parse arguments from hipLaunchKernelGGL source text
   std::vector<std::string> parseHipLaunchArgs(const std::string &text) const;
+
+  /// Insert #include directive for the stub header into the source
+  void insertStubInclude(const KernelInfo &kernel);
+
+  /// Replace blockIdx with threadIdx in a kernel body (for blockIdx-only kernels)
+  void replaceBlockIdxWithThreadIdx(const KernelInfo &kernel);
 };
 
 } // namespace vortex

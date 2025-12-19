@@ -43,6 +43,15 @@ bool HIPSourceTransformer::transform(TranslationUnitDecl *TU) {
   llvm::outs() << "[HIPSourceTransform] Found " << kernels.size()
                << " kernel(s) and " << launchSites.size() << " launch site(s)\n";
 
+  // First: For kernels that use blockIdx without threadIdx, replace blockIdx→threadIdx
+  // and swap grid/block dimensions in launch calls
+  for (const auto &kernel : kernels) {
+    if (kernel.needsBlockIdxConversion()) {
+      replaceBlockIdxWithThreadIdx(kernel);
+      kernelsNeedingConversion[kernel.demangledName] = true;
+    }
+  }
+
   // Second pass: insert wrappers, stub includes, and replace calls
   // Insert wrappers for each unique kernel that has launch sites
   for (const auto &site : launchSites) {
@@ -140,6 +149,21 @@ KernelInfo HIPSourceTransformer::analyzeKernel(const FunctionDecl *FD) {
     info.arguments.push_back(argInfo);
   }
 
+  // Detect blockIdx/threadIdx usage in kernel body
+  if (FD->hasBody()) {
+    BlockThreadIdxVisitor visitor;
+    visitor.TraverseStmt(const_cast<Stmt*>(FD->getBody()));
+    info.usesBlockIdx = visitor.usesBlockIdx;
+    info.usesThreadIdx = visitor.usesThreadIdx;
+    info.usesBlockDim = visitor.usesBlockDim;
+    info.usesGridDim = visitor.usesGridDim;
+
+    if (info.needsBlockIdxConversion()) {
+      llvm::outs() << "[HIPSourceTransform] Kernel " << info.demangledName
+                   << " uses blockIdx but not threadIdx - will convert\n";
+    }
+  }
+
   return info;
 }
 
@@ -155,6 +179,9 @@ std::string HIPSourceTransformer::generateWrapperFunction(const KernelInfo &kern
 
   std::string wrapperName = getWrapperName(kernel.demangledName);
   std::string stubName = "launch_" + kernel.demangledName;
+
+  // Check if this kernel needs grid/block swap (blockIdx→threadIdx conversion)
+  bool needsSwap = kernel.needsBlockIdxConversion();
 
   // Build parameter list string: kernel args first, then grid/block dims
   std::ostringstream paramList;
@@ -182,22 +209,30 @@ std::string HIPSourceTransformer::generateWrapperFunction(const KernelInfo &kern
   std::string params = paramList.str();
   std::string args = argNames.str();
 
+  // Determine grid/block args for the launch (swap if needed)
+  std::string gridArg = needsSwap ? "__block" : "__grid";
+  std::string blockArg = needsSwap ? "__grid" : "__block";
+
   // Generate conditional wrapper for host vs device compilation
   os << "\n// Generated wrapper for kernel argument order preservation\n";
+  if (needsSwap) {
+    os << "// NOTE: blockIdx→threadIdx conversion - grid/block dimensions swapped\n";
+  }
   os << "// On host: calls generated stub for proper argument marshaling\n";
   os << "// On device: uses <<<>>> syntax for Polygeist processing\n";
   os << "#ifdef HIP_HOST_COMPILATION\n";
 
   // HOST version: call the generated stub function which uses vortexLaunchKernel
   os << "__attribute__((noinline)) void " << wrapperName << "(" << params << ") {\n";
-  os << "    " << stubName << "(__grid, __block, " << args << ");\n";
+  os << "    " << stubName << "(" << gridArg << ", " << blockArg << ", " << args << ");\n";
   os << "}\n";
 
   os << "#else\n";
 
   // DEVICE version: use kernel launch syntax for Polygeist/MLIR processing
+  // Use swapped grid/block if this kernel had blockIdx→threadIdx conversion
   os << "__attribute__((noinline)) void " << wrapperName << "(" << params << ") {\n";
-  os << "    " << kernel.demangledName << "<<<__grid, __block>>>(" << args << ");\n";
+  os << "    " << kernel.demangledName << "<<<" << gridArg << ", " << blockArg << ">>>(" << args << ");\n";
   os << "}\n";
 
   os << "#endif\n\n";
@@ -437,6 +472,58 @@ void HIPSourceTransformer::replaceLaunchWithWrapper(const LaunchSiteInfo &site) 
                << (success ? "failure" : "success") << "\n";  // Note: ReplaceText returns true on error
   llvm::outs() << "[HIPSourceTransform] Replaced launch with wrapper call for: "
                << site.kernelName << "\n";
+}
+
+void HIPSourceTransformer::replaceBlockIdxWithThreadIdx(const KernelInfo &kernel) {
+  // Replace all occurrences of "blockIdx" with "threadIdx" in the kernel body
+  // This is needed for kernels that only use blockIdx (unusual pattern)
+  // The grid/block dimensions will be swapped in the wrapper call
+
+  if (!kernel.decl->hasBody()) {
+    llvm::errs() << "[HIPSourceTransform] Kernel " << kernel.demangledName
+                 << " has no body - cannot replace blockIdx\n";
+    return;
+  }
+
+  // Get the source range of the kernel body
+  Stmt *body = const_cast<Stmt*>(kernel.decl->getBody());
+  SourceRange bodyRange = body->getSourceRange();
+
+  // Get the source text
+  std::string bodyText = getSourceText(bodyRange);
+  if (bodyText.empty()) {
+    llvm::errs() << "[HIPSourceTransform] Failed to get kernel body text for "
+                 << kernel.demangledName << "\n";
+    return;
+  }
+
+  // Simple string replacement - replace "blockIdx" with "threadIdx"
+  std::string newText = bodyText;
+  size_t pos = 0;
+  while ((pos = newText.find("blockIdx", pos)) != std::string::npos) {
+    newText.replace(pos, 8, "threadIdx");
+    pos += 9;  // Length of "threadIdx"
+  }
+
+  if (newText == bodyText) {
+    llvm::outs() << "[HIPSourceTransform] No blockIdx found in kernel "
+                 << kernel.demangledName << "\n";
+    return;
+  }
+
+  // Replace the kernel body with the modified text
+  SourceLocation begin = bodyRange.getBegin();
+  SourceLocation end = Lexer::getLocForEndOfToken(bodyRange.getEnd(), 0, SM, ctx.getLangOpts());
+  CharSourceRange charRange = CharSourceRange::getCharRange(begin, end);
+
+  bool success = rewriter.ReplaceText(charRange, newText);
+  if (success) {  // ReplaceText returns true on error
+    llvm::errs() << "[HIPSourceTransform] Failed to replace blockIdx in kernel "
+                 << kernel.demangledName << "\n";
+  } else {
+    llvm::outs() << "[HIPSourceTransform] Replaced blockIdx with threadIdx in kernel "
+                 << kernel.demangledName << "\n";
+  }
 }
 
 std::string HIPSourceTransformer::getTransformedSource() const {

@@ -794,6 +794,8 @@ struct KernelArgInfo {
   unsigned size;     // Size in bytes
   unsigned offset;   // Offset in args struct
   bool isPointer;
+  bool isSynthetic = false;  // True for Polygeist-generated args (loop bounds)
+  int sourceArg = -1;        // For synthetic args: which user arg to derive value from
 };
 
 /// Structure to hold complete kernel metadata
@@ -1086,22 +1088,44 @@ static void emitKernelMetadata(gpu::GPUFuncOp funcOp, StringRef outputDir) {
     auto argTypes = funcOp.getArgumentTypes();
     unsigned totalArgs = argTypes.size();
 
-    // Check for captured args (trailing llvm.ptr that are device-side globals, not user args)
-    // These are marked by ReorderGPUKernelArgsPass for kernels that capture globals (e.g., printf format strings)
-    unsigned numCapturedArgs = 0;
-    if (auto capturedAttr = funcOp->getAttrOfType<IntegerAttr>("vortex.num_captured_args")) {
-      numCapturedArgs = capturedAttr.getInt();
-      llvm::outs() << "  Skipping " << numCapturedArgs << " captured args\n";
+    // Check for synthetic args (not user args):
+    // - llvm.ptr: captured globals (e.g., printf format strings) - SKIP these
+    // - index: loop bounds that Polygeist hoists into kernel parameters - INCLUDE these
+    //
+    // Captured globals are handled by Polygeist and don't need host data.
+    // Index args (loop bounds) need buffer space and values derived from user args.
+    //
+    // Count synthetic args by type:
+    unsigned numSyntheticPtrArgs = 0;  // llvm.ptr - skip from metadata
+    unsigned numSyntheticIndexArgs = 0;  // index - include in metadata
+    for (unsigned i = 0; i < totalArgs; ++i) {
+      Type argType = argTypes[i];
+      if (argType.isa<LLVM::LLVMPointerType>()) {
+        numSyntheticPtrArgs++;
+      } else if (argType.isa<IndexType>()) {
+        numSyntheticIndexArgs++;
+      }
     }
+    llvm::outs() << "  Synthetic args: " << numSyntheticPtrArgs << " ptr (skip), "
+                 << numSyntheticIndexArgs << " index (include)\n";
 
-    // Effective total args (excluding captured globals)
-    unsigned effectiveTotalArgs = (totalArgs > numCapturedArgs) ? (totalArgs - numCapturedArgs) : totalArgs;
+    // Only skip ptr-type synthetic args (captured globals)
+    // Index args need to be included for proper buffer allocation
+    unsigned effectiveTotalArgs = (totalArgs > numSyntheticPtrArgs) ? (totalArgs - numSyntheticPtrArgs) : totalArgs;
 
     // Use kernel_arg_mapping attribute to identify user args
     // The mapping tells us which host wrapper arg each kernel arg came from.
     // Host wrapper signature is: (user_arg0, user_arg1, ..., __blocks, __threads)
     // The last 2 host args are grid/block dimensions, NOT user args.
     SmallVector<unsigned> userArgIndices;
+
+    // Track which args are index-type (synthetic loop bounds)
+    SmallVector<bool, 8> isIndexArg(totalArgs, false);
+    for (unsigned i = 0; i < totalArgs; ++i) {
+      if (argTypes[i].isa<IndexType>()) {
+        isIndexArg[i] = true;
+      }
+    }
 
     if (auto mappingAttr = funcOp->getAttrOfType<DenseI64ArrayAttr>("kernel_arg_mapping")) {
       auto mapping = mappingAttr.asArrayRef();
@@ -1122,10 +1146,18 @@ static void emitKernelMetadata(gpu::GPUFuncOp funcOp, StringRef outputDir) {
         llvm::SmallSet<int64_t, 8> seenHostArgs;
         for (unsigned i = 0; i < mapping.size() && i < effectiveTotalArgs; ++i) {
           int64_t hostIdx = mapping[i];
+          // Include arg if:
+          // 1. It's a valid user arg (traced from host wrapper), OR
+          // 2. It's an index-type synthetic arg (loop bound - needs buffer space)
           if (hostIdx >= 0 && hostIdx <= maxUserArgIdx) {
             if (seenHostArgs.insert(hostIdx).second) {
               userArgIndices.push_back(i);
             }
+          } else if (isIndexArg[i]) {
+            // Synthetic index arg (loop bound) - include for buffer allocation
+            // The runtime will initialize this based on a heuristic
+            userArgIndices.push_back(i);
+            llvm::outs() << "  Including synthetic index arg " << i << " for buffer allocation\n";
           }
         }
       }
@@ -1182,22 +1214,10 @@ static void emitKernelMetadata(gpu::GPUFuncOp funcOp, StringRef outputDir) {
     }
   }
 
-  // Write C header file
-  {
-    SmallString<256> headerPath(outDir);
-    llvm::sys::path::append(headerPath, meta.kernelName + "_args.h");
-
-    std::error_code ec;
-    llvm::raw_fd_ostream outFile(headerPath, ec);
-    if (ec) {
-      llvm::errs() << "Error writing header file " << headerPath << ": "
-                   << ec.message() << "\n";
-    } else {
-      outFile << generateKernelArgsHeader(meta);
-      outFile.close();
-      llvm::outs() << "Wrote kernel args header: " << headerPath << "\n";
-    }
-  }
+  // NOTE: _args.h stub generation is now handled by HIPSourceTransform (clang AST pass)
+  // which generates stubs with correct argument order BEFORE Polygeist reorders them.
+  // We only generate .meta.json here for runtime metadata.
+  // The _args.h generation code has been disabled to avoid overwriting correct stubs.
 }
 
 //===----------------------------------------------------------------------===//

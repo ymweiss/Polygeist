@@ -227,6 +227,9 @@ static cl::opt<std::string> ResourceDir("resource-dir", cl::init(""),
 static cl::opt<std::string> SysRoot("sysroot", cl::init(""),
                                     cl::desc("sysroot"));
 
+static cl::opt<std::string> StdLib("stdlib", cl::init(""),
+                                   cl::desc("C++ standard library to use (e.g., libc++, libstdc++)"));
+
 static cl::opt<bool> EarlyVerifier("early-verifier", cl::init(false),
                                    cl::desc("Enable verifier ASAP"));
 
@@ -712,6 +715,7 @@ int main(int argc, char **argv) {
           optPM.addPass(mlir::createLowerAffinePass());
         optPM.addPass(mlir::polygeist::createPolygeistCanonicalizePass(
             canonicalizerConfig, {}, {}));
+
         pm.addPass(mlir::createInlinerPass());
         mlir::OpPassManager &optPM2 = pm.nest<mlir::func::FuncOp>();
         optPM2.addPass(mlir::polygeist::createPolygeistCanonicalizePass(
@@ -757,6 +761,21 @@ int main(int argc, char **argv) {
       noptPM.addPass(polygeist::createPolygeistMem2RegPass());
       noptPM.addPass(mlir::polygeist::createPolygeistCanonicalizePass(
           canonicalizerConfig, {}, {}));
+
+      // IMPORTANT: Outline kernels BEFORE the inliner runs.
+      // This preserves kernel argument order by extracting the kernel from
+      // gpu.launch before the inliner can inline the kernel call and scramble
+      // the operand order (getUsedValuesDefinedAbove returns first-use order).
+      if (EmitGPU) {
+        // Sink index_cast operations into gpu.launch to reduce kernel parameters.
+        // This prevents duplicate parameters (e.g., count as i32 AND count as index).
+        pm.addPass(polygeist::createSinkIndexCastsIntoGPULaunchPass());
+        pm.addPass(mlir::createGpuKernelOutliningPass());
+        pm.addPass(polygeist::createMergeGPUModulesPass());
+        // Fix kernel arg order using wrapper function's arg order
+        pm.addPass(polygeist::createReorderGPUKernelArgsPass());
+      }
+
       pm.addPass(mlir::createInlinerPass());
       mlir::OpPassManager &noptPM2 = pm.nest<mlir::func::FuncOp>();
       noptPM2.addPass(mlir::polygeist::createPolygeistCanonicalizePass(
@@ -906,9 +925,13 @@ int main(int argc, char **argv) {
       // We cannot canonicalize here because we have sunk some operations in the
       // kernel which the canonicalizer would hoist
 
+      // Sink index_cast operations into gpu.launch to reduce kernel parameters.
+      pm.addPass(polygeist::createSinkIndexCastsIntoGPULaunchPass());
+
       // TODO pass in gpuDL, the format is weird
       pm.addPass(mlir::createGpuKernelOutliningPass());
       pm.addPass(polygeist::createMergeGPUModulesPass());
+      pm.addPass(polygeist::createReorderGPUKernelArgsPass());
       pm.addPass(mlir::polygeist::createPolygeistCanonicalizePass(
           canonicalizerConfig, {}, {}));
       // TODO maybe preserve info about which original kernel corresponds to

@@ -53,6 +53,16 @@ struct KernelInfo {
   std::string mangledName;          // Mangled kernel name (for linking)
   std::string demangledName;        // Human-readable name
   llvm::SmallVector<KernelArgInfo, 8> arguments;
+  bool usesBlockIdx = false;        // Kernel uses blockIdx.x/y/z
+  bool usesThreadIdx = false;       // Kernel uses threadIdx.x/y/z
+  bool usesBlockDim = false;        // Kernel uses blockDim.x/y/z
+  bool usesGridDim = false;         // Kernel uses gridDim.x/y/z
+
+  /// Returns true if kernel uses only blockIdx (no threadIdx)
+  /// This pattern needs blockIdx→threadIdx conversion
+  bool needsBlockIdxConversion() const {
+    return usesBlockIdx && !usesThreadIdx;
+  }
 
   /// Total size of all arguments (for struct packing)
   unsigned getTotalArgsSize() const {
@@ -77,6 +87,26 @@ struct DeviceFunctionInfo {
   std::string mangledName;
   std::string demangledName;
   DeviceFunctionKind kind;
+};
+
+/// Visitor to detect blockIdx/threadIdx usage in a kernel body
+class BlockThreadIdxVisitor : public clang::RecursiveASTVisitor<BlockThreadIdxVisitor> {
+public:
+  bool usesBlockIdx = false;
+  bool usesThreadIdx = false;
+  bool usesBlockDim = false;
+  bool usesGridDim = false;
+
+  bool VisitDeclRefExpr(clang::DeclRefExpr *DRE) {
+    if (auto *VD = clang::dyn_cast<clang::VarDecl>(DRE->getDecl())) {
+      llvm::StringRef name = VD->getName();
+      if (name == "blockIdx") usesBlockIdx = true;
+      else if (name == "threadIdx") usesThreadIdx = true;
+      else if (name == "blockDim") usesBlockDim = true;
+      else if (name == "gridDim") usesGridDim = true;
+    }
+    return true;
+  }
 };
 
 /// Collects kernel information from a HIP/CUDA translation unit using AST traversal.

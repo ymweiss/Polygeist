@@ -142,6 +142,10 @@ namespace std {
   // abs for float/double (using fabs)
   inline float abs(float x) { return fabsf(x); }
   inline double abs(double x) { return ::fabs(x); }
+
+  // pow overloads to avoid ambiguity with integer exponents
+  inline double pow(double base, int exp) { return ::pow(base, (double)exp); }
+  inline float pow(float base, int exp) { return powf(base, (float)exp); }
 }
 
 #else

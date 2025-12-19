@@ -189,16 +189,25 @@ generateKernelBodyWrapper(ModuleOp module, LLVM::LLVMFuncOp kernelFunc,
         if (idx > maxIdx) maxIdx = idx;
       }
     }
-    // numUserArgs is the count of unique indices from 0 to maxIdx that exist
-    // If indices are 0,1,2,3,5,5 then unique set is {0,1,2,3,5}, so numUserArgs = 4 (not 6)
-    // because index 4 is missing, indicating indices >= 4 are launch config
-    numUserArgs = 0;
-    for (int64_t i = 0; i <= maxIdx; ++i) {
-      if (seenIndices.contains(i)) {
-        numUserArgs++;
-      } else {
-        // Gap found - everything before this is user args
-        break;
+
+    // If all mappings are -1 (maxIdx stays -1), tracing completely failed.
+    // This happens when kernel is launched from main() with local variables.
+    // In this case, treat ALL kernel args as user args by clearing the mapping.
+    if (maxIdx < 0) {
+      argMapping.clear();  // No mapping info - all args will be loaded from args buffer
+      // numUserArgs stays 0, but argMapping being empty means no arg will be marked synthetic
+    } else {
+      // numUserArgs is the count of unique indices from 0 to maxIdx that exist
+      // If indices are 0,1,2,3,5,5 then unique set is {0,1,2,3,5}, so numUserArgs = 4 (not 6)
+      // because index 4 is missing, indicating indices >= 4 are launch config
+      numUserArgs = 0;
+      for (int64_t i = 0; i <= maxIdx; ++i) {
+        if (seenIndices.contains(i)) {
+          numUserArgs++;
+        } else {
+          // Gap found - everything before this is user args
+          break;
+        }
       }
     }
   }

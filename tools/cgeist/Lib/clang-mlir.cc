@@ -97,6 +97,10 @@ static cl::opt<bool>
     TransformOnly("transform-only", cl::init(false),
                   cl::desc("Only perform HIP source transformation, then exit"));
 
+static cl::opt<std::string>
+    StubOutputDir("stub-output-dir", cl::init(""),
+                  cl::desc("Output directory for generated _args.h stub headers"));
+
 ValueCategory MLIRScanner::createComplexFloat(mlir::Location loc,
                                               mlir::Value real,
                                               mlir::Value imag,
@@ -1905,6 +1909,24 @@ std::pair<ValueCategory, bool>
 MLIRScanner::EmitGPUCallExpr(clang::CallExpr *expr) {
   auto loc = getMLIRLocation(expr->getExprLoc());
   if (auto ic = dyn_cast<ImplicitCastExpr>(expr->getCallee())) {
+    // Debug: Check for GPU builtin member calls
+    if (auto ME = dyn_cast<MemberExpr>(ic->getSubExpr())) {
+      auto memberName = ME->getMemberDecl()->getName();
+      if (memberName.starts_with("__fetch_builtin")) {
+        llvm::errs() << "[EmitGPUCallExpr] Found __fetch_builtin member: " << memberName << "\n";
+        if (auto sr2 = dyn_cast<OpaqueValueExpr>(ME->getBase())) {
+          if (auto sr = dyn_cast<DeclRefExpr>(sr2->getSourceExpr())) {
+            llvm::errs() << "[EmitGPUCallExpr] Base is: " << sr->getDecl()->getName() << "\n";
+          } else {
+            llvm::errs() << "[EmitGPUCallExpr] OpaqueValue source is not DeclRefExpr\n";
+            sr2->getSourceExpr()->dump();
+          }
+        } else {
+          llvm::errs() << "[EmitGPUCallExpr] Base is not OpaqueValueExpr: ";
+          ME->getBase()->dump();
+        }
+      }
+    }
     if (auto sr = dyn_cast<DeclRefExpr>(ic->getSubExpr())) {
       if (sr->getDecl()->getIdentifier() &&
           sr->getDecl()->getName() == "__syncthreads") {
@@ -2042,14 +2064,21 @@ MLIRScanner::EmitGPUCallExpr(clang::CallExpr *expr) {
               loc, mlir::IndexType::get(builder.getContext()), str));
     };
 
+    llvm::errs() << "[EmitGPUCallExpr] Checking for MemberExpr at line 2067\n";
     if (auto ME = dyn_cast<MemberExpr>(ic->getSubExpr())) {
       auto memberName = ME->getMemberDecl()->getName();
+      llvm::errs() << "[EmitGPUCallExpr] Found MemberExpr, member: " << memberName << "\n";
 
       if (auto sr2 = dyn_cast<OpaqueValueExpr>(ME->getBase())) {
         if (auto sr = dyn_cast<DeclRefExpr>(sr2->getSourceExpr())) {
+          llvm::errs() << "[EmitGPUCallExpr] Found DeclRefExpr base: " << sr->getDecl()->getName() << "\n";
           if (sr->getDecl()->getName() == "blockIdx") {
+            llvm::errs() << "[EmitGPUCallExpr] Creating BlockIdOp for blockIdx." << memberName
+                         << " in function: " << (EmittingFunctionDecl ? EmittingFunctionDecl->getNameAsString() : "unknown") << "\n";
             auto mlirType = getMLIRType(expr->getType());
             if (memberName == "__fetch_builtin_x") {
+              llvm::errs() << "[EmitGPUCallExpr] Returning BlockIdOp for x! Function: "
+                           << (EmittingFunctionDecl ? EmittingFunctionDecl->getNameAsString() : "unknown") << "\n";
               return make_pair(
                   ValueCategory(createBlockIdOp(gpu::Dimension::x, mlirType),
                                 /*isReference*/ false),
@@ -2090,8 +2119,12 @@ MLIRScanner::EmitGPUCallExpr(clang::CallExpr *expr) {
             }
           }
           if (sr->getDecl()->getName() == "threadIdx") {
+            llvm::errs() << "[EmitGPUCallExpr] Creating ThreadIdOp for threadIdx." << memberName
+                         << " in function: " << (EmittingFunctionDecl ? EmittingFunctionDecl->getNameAsString() : "unknown") << "\n";
             auto mlirType = getMLIRType(expr->getType());
             if (memberName == "__fetch_builtin_x") {
+              llvm::errs() << "[EmitGPUCallExpr] Returning ThreadIdOp for x! Function: "
+                           << (EmittingFunctionDecl ? EmittingFunctionDecl->getNameAsString() : "unknown") << "\n";
               return make_pair(
                   ValueCategory(createThreadIdOp(gpu::Dimension::x, mlirType),
                                 /*isReference*/ false),
@@ -3569,6 +3602,13 @@ ValueCategory MLIRScanner::VisitMemberExpr(MemberExpr *ME) {
   auto memberName = ME->getMemberDecl()->getName();
   if (auto sr2 = dyn_cast<OpaqueValueExpr>(ME->getBase())) {
     if (auto sr = dyn_cast<DeclRefExpr>(sr2->getSourceExpr())) {
+      llvm::StringRef baseName = sr->getDecl()->getName();
+      if (baseName == "blockIdx" || baseName == "threadIdx" ||
+          baseName == "blockDim" || baseName == "gridDim") {
+        llvm::errs() << "[VisitMemberExpr] GPU builtin detected: " << baseName
+                     << ", member: " << memberName << "\n";
+        ME->dump();
+      }
       if (sr->getDecl()->getName() == "blockIdx") {
         if (memberName == "__fetch_builtin_x") {
         }
@@ -5702,6 +5742,16 @@ void MLIRASTConsumer::HandleTranslationUnit(ASTContext &C) {
       if (transformer.writeToFile(outputPath)) {
         llvm::outs() << "[HIPSourceTransform] Successfully wrote transformed source to: "
                      << outputPath << "\n";
+
+        // Generate stub headers if output directory is specified
+        if (!StubOutputDir.getValue().empty()) {
+          if (transformer.writeStubHeader(StubOutputDir.getValue())) {
+            llvm::outs() << "[HIPSourceTransform] Generated stub headers in: "
+                         << StubOutputDir.getValue() << "\n";
+          } else {
+            llvm::errs() << "[HIPSourceTransform] Failed to generate stub headers\n";
+          }
+        }
       } else {
         llvm::errs() << "[HIPSourceTransform] Failed to write transformed source\n";
       }

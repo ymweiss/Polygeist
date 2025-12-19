@@ -300,6 +300,41 @@ def ConvertPolygeistToLLVM : Pass<"convert-polygeist-to-llvm", "mlir::ModuleOp">
   ];
 }
 
+def SinkIndexCastsIntoGPULaunch : Pass<"sink-index-casts-into-gpu-launch"> {
+  let summary = "Sink arith.index_cast operations into gpu.launch regions";
+  let description = [{
+    This pass sinks arith.index_cast operations into gpu.launch regions to
+    reduce the number of kernel parameters. When a value is captured by a
+    gpu.launch and then index_cast'd for use in an scf.for loop bound,
+    both the original value and the cast result become separate kernel parameters.
+
+    This pass identifies such cases and sinks the index_cast into the launch
+    region, so only the original value needs to be captured.
+
+    Example:
+      Before:
+        %count = ...  // i32
+        %bound = arith.index_cast %count : i32 to index
+        gpu.launch ... {
+          scf.for %i = 0 to %bound step 1 { ... }
+        }
+
+      After:
+        %count = ...  // i32
+        gpu.launch ... {
+          %bound = arith.index_cast %count : i32 to index
+          scf.for %i = 0 to %bound step 1 { ... }
+        }
+
+    This pass should run BEFORE gpu-kernel-outlining.
+  }];
+  let constructor = "mlir::polygeist::createSinkIndexCastsIntoGPULaunchPass()";
+  let dependentDialects = [
+    "gpu::GPUDialect",
+    "arith::ArithDialect",
+  ];
+}
+
 def ReorderGPUKernelArgs : Pass<"reorder-gpu-kernel-args", "ModuleOp"> {
   let summary = "Reorder GPU kernel arguments to match original HIP kernel signature";
   let description = [{
@@ -439,6 +474,42 @@ def ConvertGPULaunchToHostCall : Pass<"convert-gpu-launch-to-host-call", "Module
     For device compilation, use --convert-gpu-to-vortex instead.
   }];
   let constructor = "mlir::polygeist::createConvertGPULaunchToHostCallPass()";
+  let dependentDialects = [
+    "LLVM::LLVMDialect",
+    "gpu::GPUDialect",
+    "memref::MemRefDialect",
+    "func::FuncDialect",
+  ];
+}
+
+def GenerateVortexWrappers : Pass<"generate-vortex-wrappers", "ModuleOp"> {
+  let summary = "Generate launch wrapper functions for Vortex kernels";
+  let description = [{
+    This pass runs AFTER kernel outlining and generates launch wrapper functions
+    that call gpu.launch_func with the correct argument order.
+
+    The wrappers:
+    - Accept kernel arguments in the original HIP source order
+    - Accept grid and block dimensions as additional index parameters
+    - Call gpu.launch_func to invoke the outlined kernel
+    - Are marked for host compilation (not device)
+
+    The generated wrapper function has the signature:
+      func @__vortex_launch_<kernel>(kernel_args..., gridX, gridY, gridZ, blockX, blockY, blockZ)
+
+    This pass should run:
+    - AFTER kernel outlining (so gpu.launch_func ops exist)
+    - BEFORE convert-gpu-launch-to-host-call (which lowers the wrapper to runtime calls)
+
+    Example:
+      // Input: gpu.launch_func @kernel_module::@my_kernel blocks in (...) threads in (...) args(...)
+      // Output: Additional wrapper function:
+      // func @__vortex_launch_my_kernel(..., gridX, gridY, gridZ, blockX, blockY, blockZ) {
+      //   gpu.launch_func @kernel_module::@my_kernel ...
+      //   return
+      // }
+  }];
+  let constructor = "mlir::polygeist::createGenerateVortexWrappersPass()";
   let dependentDialects = [
     "LLVM::LLVMDialect",
     "gpu::GPUDialect",
