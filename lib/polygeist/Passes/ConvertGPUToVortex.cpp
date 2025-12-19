@@ -454,6 +454,54 @@ struct PrintfOpLowering : public OpRewritePattern<LLVM::CallOp> {
   }
 };
 
+/// Lower __threadfence* calls to RISC-V fence instructions
+/// Matches: func.call @__threadfence* (void)
+/// Replaces with: llvm.inline_asm "fence rw, rw" or "fence iorw, iorw"
+///
+/// Fence semantics:
+/// - __threadfence_block(): Orders memory accesses for all threads within a block
+/// - __threadfence(): Orders memory accesses for all threads on the device
+/// - __threadfence_system(): Orders memory accesses visible to other devices and host
+struct ThreadFenceOpLowering : public OpRewritePattern<func::CallOp> {
+  using OpRewritePattern<func::CallOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(func::CallOp callOp,
+                                 PatternRewriter &rewriter) const override {
+    StringRef name = callOp.getCallee();
+
+    // Match fence function names and determine instruction
+    StringRef fenceAsm;
+    if (name == "__threadfence" || name == "__threadfence_block") {
+      // Block and device scope use same instruction on Vortex (single-core)
+      fenceAsm = "fence rw, rw";
+    } else if (name == "__threadfence_system") {
+      // System scope includes I/O for visibility to host/other devices
+      fenceAsm = "fence iorw, iorw";
+    } else {
+      return failure();
+    }
+
+    // Only lower inside GPU modules
+    auto gpuModule = callOp->getParentOfType<gpu::GPUModuleOp>();
+    if (!gpuModule)
+      return failure();
+
+    // Emit RISC-V fence inline assembly
+    rewriter.replaceOpWithNewOp<LLVM::InlineAsmOp>(
+        callOp,
+        /*res=*/TypeRange{},
+        /*operands=*/ValueRange{},
+        /*asm_string=*/fenceAsm,
+        /*constraints=*/"",
+        /*has_side_effects=*/true,
+        /*is_align_stack=*/false,
+        /*asm_dialect=*/LLVM::AsmDialectAttr{},
+        /*operand_attrs=*/ArrayAttr{});
+
+    return success();
+  }
+};
+
 //===----------------------------------------------------------------------===//
 // Shared Memory Lowering (Address Space 3)
 //===----------------------------------------------------------------------===//
@@ -957,7 +1005,8 @@ static std::string generateMetadataJSON(const KernelMetadata &meta,
 /// Extract metadata from a GPU function and write metadata files
 /// Generates both .meta.json (for runtime) and _args.h (for compile-time)
 /// If outputDir is empty, uses current working directory
-/// Uses kernel_arg_mapping attribute to identify which kernel args are user args
+/// Prioritizes vortex.kernel_args attribute (original HIP order from AST)
+/// Falls back to kernel_arg_mapping + MLIR types if not available
 static void emitKernelMetadata(gpu::GPUFuncOp funcOp, StringRef outputDir) {
   if (!funcOp.isKernel())
     return;
@@ -965,79 +1014,137 @@ static void emitKernelMetadata(gpu::GPUFuncOp funcOp, StringRef outputDir) {
   KernelMetadata meta;
   meta.kernelName = funcOp.getName().str();
 
-  // Extract base kernel name (remove Polygeist suffix if present)
-  StringRef baseName = extractBaseKernelName(funcOp.getName());
-  meta.kernelName = baseName.str();
+  // PRIORITY 0: Check for vortex.kernel_name attribute (set by ReorderGPUKernelArgsPass)
+  // This contains the ORIGINAL HIP kernel name before inlining/outlining mangled it
+  if (auto kernelNameAttr = funcOp->getAttrOfType<StringAttr>("vortex.kernel_name")) {
+    meta.kernelName = kernelNameAttr.getValue().str();
+    llvm::outs() << "Using vortex.kernel_name attribute: " << meta.kernelName << "\n";
+  } else {
+    // Extract base kernel name (remove Polygeist suffix if present)
+    StringRef baseName = extractBaseKernelName(funcOp.getName());
+    meta.kernelName = baseName.str();
+    llvm::outs() << "Using function name: " << meta.kernelName << "\n";
+  }
 
-  auto argTypes = funcOp.getArgumentTypes();
-  unsigned totalArgs = argTypes.size();
+  // PRIORITY 1: Use vortex.kernel_args attribute if available
+  // This contains the ORIGINAL HIP argument order from AST, which is what the
+  // host code expects. The MLIR function signature may have reordered args.
+  if (auto vortexArgsAttr = funcOp->getAttrOfType<ArrayAttr>("vortex.kernel_args")) {
+    llvm::outs() << "Using vortex.kernel_args attribute for " << meta.kernelName
+                 << " (original HIP argument order)\n";
 
-  // Use kernel_arg_mapping attribute to identify user args
-  // The mapping tells us which host wrapper arg each kernel arg came from.
-  // Host wrapper signature is: (user_arg0, user_arg1, ..., __blocks, __threads)
-  // The last 2 host args are grid/block dimensions, NOT user args.
-  // Kernel may have synthetic args (e.g., iteration count) that are derived from dims.
-  // These are identified by:
-  //   1. Duplicate mappings (same host arg used for multiple kernel args)
-  //   2. Mapping to the last 2 host args (dim parameters)
-  SmallVector<unsigned> userArgIndices;
+    unsigned offset = 0;
+    for (auto argAttr : vortexArgsAttr) {
+      auto argDict = argAttr.dyn_cast<DictionaryAttr>();
+      if (!argDict) continue;
 
-  if (auto mappingAttr = funcOp->getAttrOfType<DenseI64ArrayAttr>("kernel_arg_mapping")) {
-    auto mapping = mappingAttr.asArrayRef();
+      KernelArgInfo argInfo;
 
-    // Find the maximum host arg index to determine dim arg boundary
-    // Host wrapper args: 0 to maxHostIdx, where:
-    //   - args 0 to maxHostIdx-2 are user args
-    //   - args maxHostIdx-1 and maxHostIdx are __blocks and __threads
-    int64_t maxHostIdx = -1;
-    for (int64_t idx : mapping) {
-      if (idx > maxHostIdx) maxHostIdx = idx;
+      // Extract name
+      if (auto nameAttr = argDict.getAs<StringAttr>("name"))
+        argInfo.name = nameAttr.getValue().str();
+      else
+        argInfo.name = "arg" + std::to_string(meta.arguments.size());
+
+      // Extract type string
+      if (auto typeAttr = argDict.getAs<StringAttr>("type"))
+        argInfo.type = typeAttr.getValue().str();
+      else
+        argInfo.type = "unknown";
+
+      // Extract size (from AST, this is host size - we need device size)
+      // For pointers: host=8 bytes (64-bit), device=4 bytes (RV32)
+      if (auto sizeAttr = argDict.getAs<IntegerAttr>("size"))
+        argInfo.size = sizeAttr.getInt();
+      else
+        argInfo.size = 4;
+
+      // Check if pointer
+      if (auto isPtrAttr = argDict.getAs<BoolAttr>("is_pointer"))
+        argInfo.isPointer = isPtrAttr.getValue();
+      else
+        argInfo.isPointer = (argInfo.type.find('*') != std::string::npos);
+
+      // For device struct, pointers are 4 bytes (RV32), not 8 bytes
+      unsigned deviceSize = argInfo.isPointer ? 4 : argInfo.size;
+
+      // Compute offset (recalculate for device layout)
+      argInfo.offset = offset;
+      offset += deviceSize;
+      // Update size to device size for the metadata
+      argInfo.size = deviceSize;
+
+      meta.arguments.push_back(argInfo);
     }
+    meta.totalArgsSize = offset;
 
-    // User args are those with hostIdx <= maxHostIdx - 2
-    // (excludes the last 2 host args which are __blocks, __threads)
-    int64_t maxUserArgIdx = maxHostIdx - 2;
+  } else {
+    // PRIORITY 2: Fall back to kernel_arg_mapping + MLIR function types
+    // This path is used when vortex.kernel_args attribute is not propagated
+    llvm::outs() << "Falling back to kernel_arg_mapping for " << meta.kernelName << "\n";
 
-    // Collect kernel arg indices that map to unique USER host args
-    llvm::SmallSet<int64_t, 8> seenHostArgs;
-    for (unsigned i = 0; i < mapping.size(); ++i) {
-      int64_t hostIdx = mapping[i];
-      // Only include args that:
-      // 1. Have valid host mapping (>= 0)
-      // 2. Map to user args (not dim args)
-      // 3. Haven't been seen yet (deduplication)
-      if (hostIdx >= 0 && hostIdx <= maxUserArgIdx) {
-        if (seenHostArgs.insert(hostIdx).second) {
+    auto argTypes = funcOp.getArgumentTypes();
+    unsigned totalArgs = argTypes.size();
+
+    // Use kernel_arg_mapping attribute to identify user args
+    // The mapping tells us which host wrapper arg each kernel arg came from.
+    // Host wrapper signature is: (user_arg0, user_arg1, ..., __blocks, __threads)
+    // The last 2 host args are grid/block dimensions, NOT user args.
+    SmallVector<unsigned> userArgIndices;
+
+    if (auto mappingAttr = funcOp->getAttrOfType<DenseI64ArrayAttr>("kernel_arg_mapping")) {
+      auto mapping = mappingAttr.asArrayRef();
+
+      // Find the maximum host arg index to determine dim arg boundary
+      int64_t maxHostIdx = -1;
+      for (int64_t idx : mapping) {
+        if (idx > maxHostIdx) maxHostIdx = idx;
+      }
+
+      // If all mappings are -1, tracing completely failed
+      if (maxHostIdx < 0) {
+        for (unsigned i = 0; i < totalArgs; ++i) {
           userArgIndices.push_back(i);
         }
+      } else {
+        int64_t maxUserArgIdx = maxHostIdx - 2;
+        llvm::SmallSet<int64_t, 8> seenHostArgs;
+        for (unsigned i = 0; i < mapping.size(); ++i) {
+          int64_t hostIdx = mapping[i];
+          if (hostIdx >= 0 && hostIdx <= maxUserArgIdx) {
+            if (seenHostArgs.insert(hostIdx).second) {
+              userArgIndices.push_back(i);
+            }
+          }
+        }
+      }
+    } else {
+      // Fallback: assume all args are user args
+      for (unsigned i = 0; i < totalArgs; ++i) {
+        userArgIndices.push_back(i);
       }
     }
-  } else {
-    // Fallback: assume all args are user args
-    for (unsigned i = 0; i < totalArgs; ++i) {
-      userArgIndices.push_back(i);
+
+    unsigned offset = 0;
+
+    for (unsigned i = 0; i < userArgIndices.size(); ++i) {
+      unsigned argIndex = userArgIndices[i];
+      Type argType = argTypes[argIndex];
+
+      KernelArgInfo argInfo;
+      argInfo.name = "arg" + std::to_string(i);  // Renumber from 0
+      argInfo.type = getMetadataTypeString(argType);
+      argInfo.size = getTypeSizeRV32(argType);
+      argInfo.offset = offset;
+      argInfo.isPointer = argType.isa<MemRefType>() ||
+                          argType.isa<LLVM::LLVMPointerType>();
+
+      meta.arguments.push_back(argInfo);
+      offset += argInfo.size;
     }
-  }
 
-  unsigned offset = 0;
-
-  for (unsigned i = 0; i < userArgIndices.size(); ++i) {
-    unsigned argIndex = userArgIndices[i];
-    Type argType = argTypes[argIndex];
-
-    KernelArgInfo argInfo;
-    argInfo.name = "arg" + std::to_string(i);  // Renumber from 0
-    argInfo.type = getMetadataTypeString(argType);
-    argInfo.size = getTypeSizeRV32(argType);
-    argInfo.offset = offset;
-    argInfo.isPointer = argType.isa<MemRefType>() ||
-                        argType.isa<LLVM::LLVMPointerType>();
-
-    meta.arguments.push_back(argInfo);
-    offset += argInfo.size;
-  }
-
-  meta.totalArgsSize = offset;
+    meta.totalArgsSize = offset;
+  }  // End of fallback (else) block
 
   // Determine output directory
   SmallString<256> outDir;
@@ -1144,7 +1251,7 @@ struct ConvertGPUToVortexPass
     // as separate greedy rewrites (these patterns don't replace ops, just annotate)
     RewritePatternSet metadataPatterns(context);
     metadataPatterns.add<LaunchFuncMetadataExtraction, PrintfOpLowering,
-                         SharedMemoryGlobalOpLowering>(context);
+                         ThreadFenceOpLowering, SharedMemoryGlobalOpLowering>(context);
     if (failed(applyPatternsAndFoldGreedily(module, std::move(metadataPatterns)))) {
       signalPassFailure();
     }

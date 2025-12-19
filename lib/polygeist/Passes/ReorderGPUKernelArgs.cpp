@@ -312,6 +312,60 @@ static bool reorderGPUKernelArguments(
 #define GEN_PASS_DEF_REORDERGPUKERNELARGS
 #include "polygeist/Passes/Passes.h.inc"
 
+/// Check if a type is a dim3 struct (memref<?x3xi32>)
+static bool isDim3Type(Type type) {
+  auto memrefType = type.dyn_cast<MemRefType>();
+  if (!memrefType)
+    return false;
+  // dim3 is lowered to memref<?x3xi32> or similar
+  auto shape = memrefType.getShape();
+  if (shape.size() != 2)
+    return false;
+  // Check for shape [?, 3] with i32 element type
+  if (shape[1] != 3)
+    return false;
+  return memrefType.getElementType().isInteger(32);
+}
+
+/// Check if a type is a pointer type (memref or LLVM pointer)
+static bool isPointerType(Type type) {
+  return type.isa<MemRefType>() || type.isa<LLVM::LLVMPointerType>();
+}
+
+/// Check if function name looks like a wrapper function
+/// Wrappers are named like: __launch_<kernel_name>, _Z<digits>__launch_<kernel_name>...
+static bool isWrapperFunctionName(StringRef name) {
+  // Direct match: __launch_
+  if (name.contains("__launch_"))
+    return true;
+  return false;
+}
+
+/// Extract kernel name from wrapper function name
+/// E.g., "_Z22__launch_vecadd_kernelPfS_S_j4dim3S0_" -> "vecadd_kernel"
+static std::string extractKernelNameFromWrapper(StringRef wrapperName) {
+  // Find "__launch_" in the name
+  size_t pos = wrapperName.find("__launch_");
+  if (pos == StringRef::npos)
+    return "";
+
+  // Skip "__launch_" prefix
+  StringRef afterLaunch = wrapperName.substr(pos + 9);
+
+  // The kernel name continues until a type suffix (capital letter or digit after underscore)
+  // Or until "Pf", "Pi", "4dim3", etc.
+  // Simple heuristic: find common suffixes
+  size_t endPos = afterLaunch.find("Pf");  // pointer to float
+  if (endPos == StringRef::npos) endPos = afterLaunch.find("Pi");  // pointer to int
+  if (endPos == StringRef::npos) endPos = afterLaunch.find("Pc");  // pointer to char
+  if (endPos == StringRef::npos) endPos = afterLaunch.find("4dim3");  // dim3 type
+  if (endPos == StringRef::npos) endPos = afterLaunch.find("j");  // uint32_t
+  if (endPos == StringRef::npos) endPos = afterLaunch.find("i");  // int32_t
+  if (endPos == StringRef::npos) endPos = afterLaunch.size();
+
+  return afterLaunch.substr(0, endPos).str();
+}
+
 struct ReorderGPUKernelArgsPass
     : public impl::ReorderGPUKernelArgsBase<ReorderGPUKernelArgsPass> {
 
@@ -320,48 +374,147 @@ struct ReorderGPUKernelArgsPass
   void runOnOperation() override {
     ModuleOp module = getOperation();
 
-    // Build argument order map from host wrapper functions
-    // This maps kernel base name -> list of (isPointer) for original args
-    llvm::StringMap<std::vector<bool>> originalArgIsPointer;
+    // Map: original kernel name -> is_pointer array for each arg
+    llvm::StringMap<std::vector<bool>> kernelArgIsPointer;
+    // Map: original kernel name -> wrapper function name (for debugging)
+    llvm::StringMap<std::string> kernelToWrapper;
 
-    // Find host wrapper functions (func.func @__polygeist_launch_<name>)
-    for (auto funcOp : module.getOps<func::FuncOp>()) {
+    llvm::outs() << "[ReorderGPUKernelArgs] Starting pass\n";
+
+    // Find wrapper functions by name pattern (they may have empty bodies after inlining)
+    // Wrapper functions have correct arg order in their signature
+    module.walk([&](func::FuncOp funcOp) {
       StringRef funcName = funcOp.getName();
-      if (!funcName.startswith("__polygeist_launch_"))
-        continue;
+      if (!isWrapperFunctionName(funcName))
+        return;
 
-      // Host wrapper args: user args... + blocks + threads (last 2 are launch params)
-      auto hostArgTypes = funcOp.getArgumentTypes();
-      unsigned numHostUserArgs = hostArgTypes.size() > 2 ? hostArgTypes.size() - 2 : 0;
-
-      std::vector<bool> isPointerVec;
-      for (unsigned i = 0; i < numHostUserArgs; ++i) {
-        isPointerVec.push_back(hostArgTypes[i].isa<MemRefType>() ||
-                               hostArgTypes[i].isa<LLVM::LLVMPointerType>());
+      std::string kernelName = extractKernelNameFromWrapper(funcName);
+      if (kernelName.empty()) {
+        llvm::outs() << "[ReorderGPUKernelArgs] Could not extract kernel name from: "
+                     << funcName << "\n";
+        return;
       }
-      originalArgIsPointer[funcName] = std::move(isPointerVec);
+
+      llvm::outs() << "[ReorderGPUKernelArgs] Found wrapper " << funcName
+                   << " for kernel " << kernelName << "\n";
+
+      // Extract user args from wrapper signature
+      // Wrapper args are: [user_arg0, user_arg1, ..., dim3_grid, dim3_block]
+      auto argTypes = funcOp.getArgumentTypes();
+      std::vector<bool> isPointer;
+
+      // Find where user args end (where dim3 args begin)
+      unsigned numUserArgs = 0;
+      for (unsigned i = 0; i < argTypes.size(); ++i) {
+        if (isDim3Type(argTypes[i])) {
+          numUserArgs = i;
+          break;
+        }
+        numUserArgs = i + 1;
+      }
+
+      llvm::outs() << "[ReorderGPUKernelArgs] Wrapper has " << numUserArgs
+                   << " user args out of " << argTypes.size() << " total\n";
+
+      // Build is_pointer array from wrapper's user args
+      for (unsigned i = 0; i < numUserArgs; ++i) {
+        bool isPtr = isPointerType(argTypes[i]) && !isDim3Type(argTypes[i]);
+        isPointer.push_back(isPtr);
+        llvm::outs() << "[ReorderGPUKernelArgs]   arg" << i << ": "
+                     << (isPtr ? "pointer" : "scalar") << "\n";
+      }
+
+      if (!isPointer.empty()) {
+        kernelArgIsPointer[kernelName] = isPointer;
+        kernelToWrapper[kernelName] = funcName.str();
+      }
+    });
+
+    if (kernelArgIsPointer.empty()) {
+      llvm::outs() << "[ReorderGPUKernelArgs] No wrapper functions found\n";
+      return;
     }
 
     // Reorder GPU kernel arguments
     module.walk([&](gpu::GPUModuleOp gpuModule) {
-      // Collect kernels to reorder (can't modify while walking)
       SmallVector<gpu::GPUFuncOp> kernelsToReorder;
-      for (auto gpuFunc : gpuModule.getOps<gpu::GPUFuncOp>()) {
+      for (auto gpuFunc : gpuModule.getOps<gpu::GPUFuncOp>())
         if (gpuFunc.isKernel())
           kernelsToReorder.push_back(gpuFunc);
-      }
 
       for (auto gpuFunc : kernelsToReorder) {
-        // Find base kernel name to look up original arg info
-        std::string baseName = extractBaseKernelName(gpuFunc.getName().str()).str();
+        StringRef gpuFuncName = gpuFunc.getName();
+        llvm::outs() << "[ReorderGPUKernelArgs] Checking gpu.func: "
+                     << gpuFuncName << "\n";
 
-        // Look up original argument order
-        auto it = originalArgIsPointer.find(baseName);
-        if (it != originalArgIsPointer.end()) {
+        // Calculate number of user args in gpu.func
+        // GPU kernel has internal args (block_dim derived) before user args
+        auto argTypes = gpuFunc.getArgumentTypes();
+        unsigned numLeadingScalars = 0;
+        for (auto argType : argTypes) {
+          if (argType.isa<MemRefType>() || argType.isa<LLVM::LLVMPointerType>())
+            break;
+          ++numLeadingScalars;
+        }
+        unsigned argsToSkip = (numLeadingScalars >= 2) ? 2 : 0;
+        unsigned numGpuUserArgs = argTypes.size() - argsToSkip;
+
+        llvm::outs() << "[ReorderGPUKernelArgs]   gpu.func has " << numGpuUserArgs
+                     << " user args (total: " << argTypes.size() << ")\n";
+
+        // Try to match gpu.func name to wrapper's kernel name
+        // 1. Try exact match first
+        auto it = kernelArgIsPointer.find(gpuFuncName);
+
+        // 2. If no exact match, try name-based matching
+        if (it == kernelArgIsPointer.end()) {
+          for (auto &entry : kernelArgIsPointer) {
+            if (gpuFuncName.contains(entry.first()) ||
+                entry.first().contains(gpuFuncName)) {
+              llvm::outs() << "[ReorderGPUKernelArgs] Name match: " << gpuFuncName
+                           << " <-> " << entry.first() << "\n";
+              it = kernelArgIsPointer.find(entry.first());
+              break;
+            }
+          }
+        }
+
+        // 3. If still no match, try matching by arg count
+        // This handles the case where gpu.func is named "main_kernel" but
+        // the wrapper has a different kernel name
+        if (it == kernelArgIsPointer.end()) {
+          for (auto &entry : kernelArgIsPointer) {
+            if (entry.second.size() == numGpuUserArgs) {
+              llvm::outs() << "[ReorderGPUKernelArgs] Arg count match: "
+                           << gpuFuncName << " (" << numGpuUserArgs << " args) <-> "
+                           << entry.first() << "\n";
+              it = kernelArgIsPointer.find(entry.first());
+              break;
+            }
+          }
+        }
+
+        if (it != kernelArgIsPointer.end()) {
+          llvm::outs() << "[ReorderGPUKernelArgs] Found arg order for "
+                       << gpuFuncName << " (wrapper kernel: " << it->first() << ")\n";
+
+          // Set vortex.kernel_name attribute with the original kernel name
+          // This is used by ConvertGPUToVortex to name the metadata files correctly
+          std::string originalKernelName = it->first().str();
+          gpuFunc->setAttr("vortex.kernel_name",
+                          StringAttr::get(gpuFunc.getContext(), originalKernelName));
+          llvm::outs() << "[ReorderGPUKernelArgs] Set vortex.kernel_name='"
+                       << originalKernelName << "' on " << gpuFuncName << "\n";
+
           reorderGPUKernelArguments(gpuModule, gpuFunc, it->second, module);
+        } else {
+          llvm::outs() << "[ReorderGPUKernelArgs] No matching wrapper for "
+                       << gpuFuncName << " (has " << numGpuUserArgs << " user args)\n";
         }
       }
     });
+
+    llvm::outs() << "[ReorderGPUKernelArgs] Pass complete\n";
   }
 };
 
