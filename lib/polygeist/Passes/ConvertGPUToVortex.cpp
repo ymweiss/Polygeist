@@ -1086,6 +1086,17 @@ static void emitKernelMetadata(gpu::GPUFuncOp funcOp, StringRef outputDir) {
     auto argTypes = funcOp.getArgumentTypes();
     unsigned totalArgs = argTypes.size();
 
+    // Check for captured args (trailing llvm.ptr that are device-side globals, not user args)
+    // These are marked by ReorderGPUKernelArgsPass for kernels that capture globals (e.g., printf format strings)
+    unsigned numCapturedArgs = 0;
+    if (auto capturedAttr = funcOp->getAttrOfType<IntegerAttr>("vortex.num_captured_args")) {
+      numCapturedArgs = capturedAttr.getInt();
+      llvm::outs() << "  Skipping " << numCapturedArgs << " captured args\n";
+    }
+
+    // Effective total args (excluding captured globals)
+    unsigned effectiveTotalArgs = (totalArgs > numCapturedArgs) ? (totalArgs - numCapturedArgs) : totalArgs;
+
     // Use kernel_arg_mapping attribute to identify user args
     // The mapping tells us which host wrapper arg each kernel arg came from.
     // Host wrapper signature is: (user_arg0, user_arg1, ..., __blocks, __threads)
@@ -1103,13 +1114,13 @@ static void emitKernelMetadata(gpu::GPUFuncOp funcOp, StringRef outputDir) {
 
       // If all mappings are -1, tracing completely failed
       if (maxHostIdx < 0) {
-        for (unsigned i = 0; i < totalArgs; ++i) {
+        for (unsigned i = 0; i < effectiveTotalArgs; ++i) {
           userArgIndices.push_back(i);
         }
       } else {
         int64_t maxUserArgIdx = maxHostIdx - 2;
         llvm::SmallSet<int64_t, 8> seenHostArgs;
-        for (unsigned i = 0; i < mapping.size(); ++i) {
+        for (unsigned i = 0; i < mapping.size() && i < effectiveTotalArgs; ++i) {
           int64_t hostIdx = mapping[i];
           if (hostIdx >= 0 && hostIdx <= maxUserArgIdx) {
             if (seenHostArgs.insert(hostIdx).second) {
@@ -1119,8 +1130,8 @@ static void emitKernelMetadata(gpu::GPUFuncOp funcOp, StringRef outputDir) {
         }
       }
     } else {
-      // Fallback: assume all args are user args
-      for (unsigned i = 0; i < totalArgs; ++i) {
+      // Fallback: assume all non-captured args are user args
+      for (unsigned i = 0; i < effectiveTotalArgs; ++i) {
         userArgIndices.push_back(i);
       }
     }

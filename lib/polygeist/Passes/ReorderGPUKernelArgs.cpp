@@ -124,12 +124,25 @@ static bool reorderGPUKernelArguments(
 
   // Skip first 2 internal args (derived from block_dim)
   unsigned argsToSkip = (numLeadingScalars >= 2) ? 2 : 0;
-  unsigned numUserArgs = argTypes.size() - argsToSkip;
+
+  // Count trailing !llvm.ptr args as captured globals (not user args)
+  // These are globals like printf format strings captured during kernel outlining
+  unsigned numTrailingLLVMPtrs = 0;
+  for (int i = argTypes.size() - 1; i >= (int)argsToSkip; --i) {
+    if (argTypes[i].isa<LLVM::LLVMPointerType>()) {
+      numTrailingLLVMPtrs++;
+    } else {
+      break;  // Stop at first non-llvm.ptr arg from the end
+    }
+  }
+
+  unsigned numUserArgs = argTypes.size() - argsToSkip - numTrailingLLVMPtrs;
 
   if (numUserArgs != originalIsPointer.size()) {
     llvm::errs() << "Warning: Argument count mismatch for reordering "
                  << gpuFunc.getName() << " - expected " << originalIsPointer.size()
-                 << " user args, got " << numUserArgs << "\n";
+                 << " user args, got " << numUserArgs
+                 << " (captured: " << numTrailingLLVMPtrs << ")\n";
     return false;
   }
 
@@ -162,6 +175,10 @@ static bool reorderGPUKernelArguments(
   for (unsigned origIdx = 0; origIdx < numUserArgs; ++origIdx) {
     unsigned devIdx = originalToDevice[origIdx];
     newArgTypes.push_back(argTypes[argsToSkip + devIdx]);
+  }
+  // Append trailing captured globals (llvm.ptr args) unchanged
+  for (unsigned i = 0; i < numTrailingLLVMPtrs; ++i) {
+    newArgTypes.push_back(argTypes[argTypes.size() - numTrailingLLVMPtrs + i]);
   }
 
   // Save the function name before any modifications
@@ -203,6 +220,7 @@ static bool reorderGPUKernelArguments(
   // We'll add them at the end first, then reorder
   SmallVector<BlockArgument> newInternalArgs;
   SmallVector<BlockArgument> newUserArgs(numUserArgs);
+  SmallVector<BlockArgument> newCapturedArgs(numTrailingLLVMPtrs);
 
   // Add new arguments for internal args (these stay in same position)
   for (unsigned i = 0; i < argsToSkip; ++i) {
@@ -221,6 +239,14 @@ static bool reorderGPUKernelArguments(
     newUserArgs[origIdx] = newArg;
   }
 
+  // For captured args, add them after user args (they stay in relative order)
+  for (unsigned i = 0; i < numTrailingLLVMPtrs; ++i) {
+    unsigned oldIdx = argsToSkip + numUserArgs + i;
+    Type argType = currentArgs[oldIdx].getType();
+    auto newArg = clonedEntry.addArgument(argType, clonedFunc.getLoc());
+    newCapturedArgs[i] = newArg;
+  }
+
   // Step 3: RAUW - redirect uses of old args to new args
   // Old arg at device position devIdx should be replaced with new arg at original position
   // deviceToOriginal[devIdx] = origIdx means device pos devIdx came from original pos origIdx
@@ -229,9 +255,15 @@ static bool reorderGPUKernelArguments(
     unsigned origIdx = deviceToOriginal[devIdx];
     currentArgs[argsToSkip + devIdx].replaceAllUsesWith(newUserArgs[origIdx]);
   }
+  // Also redirect uses of old captured args to new captured args
+  for (unsigned i = 0; i < numTrailingLLVMPtrs; ++i) {
+    unsigned oldIdx = argsToSkip + numUserArgs + i;
+    currentArgs[oldIdx].replaceAllUsesWith(newCapturedArgs[i]);
+  }
 
-  // Step 4: Remove old user arguments (in reverse order to maintain indices)
-  for (int i = numUserArgs - 1; i >= 0; --i) {
+  // Step 4: Remove old user AND captured arguments (in reverse order to maintain indices)
+  unsigned numArgsToRemove = numUserArgs + numTrailingLLVMPtrs;
+  for (int i = numArgsToRemove - 1; i >= 0; --i) {
     clonedEntry.eraseArgument(argsToSkip + i);
   }
 
@@ -262,6 +294,10 @@ static bool reorderGPUKernelArguments(
     for (unsigned origIdx = 0; origIdx < numUserArgs; ++origIdx) {
       unsigned devIdx = originalToDevice[origIdx];
       newOperands.push_back(oldOperands[argsToSkip + devIdx]);
+    }
+    // Append captured args (trailing llvm.ptr) unchanged
+    for (unsigned i = 0; i < numTrailingLLVMPtrs; ++i) {
+      newOperands.push_back(oldOperands[argsToSkip + numUserArgs + i]);
     }
 
     // Create new launch with temp function name
@@ -449,6 +485,7 @@ struct ReorderGPUKernelArgsPass
 
         // Calculate number of user args in gpu.func
         // GPU kernel has internal args (block_dim derived) before user args
+        // Also exclude trailing !llvm.ptr args which are captured globals (e.g., printf format strings)
         auto argTypes = gpuFunc.getArgumentTypes();
         unsigned numLeadingScalars = 0;
         for (auto argType : argTypes) {
@@ -457,10 +494,23 @@ struct ReorderGPUKernelArgsPass
           ++numLeadingScalars;
         }
         unsigned argsToSkip = (numLeadingScalars >= 2) ? 2 : 0;
-        unsigned numGpuUserArgs = argTypes.size() - argsToSkip;
+
+        // Count trailing !llvm.ptr args as captured globals (not user args)
+        // These are globals like printf format strings captured during kernel outlining
+        unsigned numTrailingLLVMPtrs = 0;
+        for (int i = argTypes.size() - 1; i >= (int)argsToSkip; --i) {
+          if (argTypes[i].isa<LLVM::LLVMPointerType>()) {
+            numTrailingLLVMPtrs++;
+          } else {
+            break;  // Stop at first non-llvm.ptr arg from the end
+          }
+        }
+
+        unsigned numGpuUserArgs = argTypes.size() - argsToSkip - numTrailingLLVMPtrs;
 
         llvm::outs() << "[ReorderGPUKernelArgs]   gpu.func has " << numGpuUserArgs
-                     << " user args (total: " << argTypes.size() << ")\n";
+                     << " user args (total: " << argTypes.size()
+                     << ", captured: " << numTrailingLLVMPtrs << ")\n";
 
         // Try to match gpu.func name to wrapper's kernel name
         // 1. Try exact match first
@@ -494,6 +544,15 @@ struct ReorderGPUKernelArgsPass
           }
         }
 
+        // 4. If still no match and there's exactly one wrapper and one kernel, match them
+        // This is a fallback for generic kernel names like "main_kernel"
+        if (it == kernelArgIsPointer.end() &&
+            kernelArgIsPointer.size() == 1 && kernelsToReorder.size() == 1) {
+          it = kernelArgIsPointer.begin();
+          llvm::outs() << "[ReorderGPUKernelArgs] Single-kernel fallback match: "
+                       << gpuFuncName << " <-> " << it->first() << "\n";
+        }
+
         if (it != kernelArgIsPointer.end()) {
           llvm::outs() << "[ReorderGPUKernelArgs] Found arg order for "
                        << gpuFuncName << " (wrapper kernel: " << it->first() << ")\n";
@@ -505,6 +564,18 @@ struct ReorderGPUKernelArgsPass
                           StringAttr::get(gpuFunc.getContext(), originalKernelName));
           llvm::outs() << "[ReorderGPUKernelArgs] Set vortex.kernel_name='"
                        << originalKernelName << "' on " << gpuFuncName << "\n";
+
+          // Set vortex.num_captured_args to indicate how many trailing llvm.ptr args
+          // are captured globals (not user args). ConvertGPUToVortex uses this to
+          // skip these args when generating the host stub.
+          if (numTrailingLLVMPtrs > 0) {
+            gpuFunc->setAttr("vortex.num_captured_args",
+                            IntegerAttr::get(
+                              IntegerType::get(gpuFunc.getContext(), 32),
+                              numTrailingLLVMPtrs));
+            llvm::outs() << "[ReorderGPUKernelArgs] Set vortex.num_captured_args="
+                         << numTrailingLLVMPtrs << " on " << gpuFuncName << "\n";
+          }
 
           reorderGPUKernelArguments(gpuModule, gpuFunc, it->second, module);
         } else {
