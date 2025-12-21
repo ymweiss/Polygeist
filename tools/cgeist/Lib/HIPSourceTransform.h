@@ -30,12 +30,46 @@
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/AST/ExprCXX.h"
 #include "clang/Rewrite/Core/Rewriter.h"
+#include "llvm/ADT/APSInt.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringRef.h"
+#include <optional>
+#include <set>
 #include <string>
 #include <vector>
 #include <map>
 
 namespace vortex {
+
+/// Analyzes kernel launch arguments to detect compile-time constants.
+/// MLIR performs constant folding on kernel arguments, so we must do
+/// the same on the host side to ensure argument counts match.
+class ConstantArgumentAnalyzer {
+public:
+  /// Analyze a kernel launch site and determine which args are constants
+  void analyzeLaunchSite(const clang::CUDAKernelCallExpr *launch,
+                         clang::ASTContext &ctx);
+
+  /// Check if argument at index is a compile-time constant
+  bool isConstant(unsigned argIndex) const;
+
+  /// Get the constant value (if known) for an argument
+  std::optional<llvm::APSInt> getConstantValue(unsigned argIndex) const;
+
+  /// Get set of constant argument indices
+  std::set<unsigned> getConstantArgIndices() const;
+
+  /// Clear the analysis
+  void clear();
+
+private:
+  /// Map from arg index to constant value (if constant)
+  llvm::DenseMap<unsigned, llvm::APSInt> constantArgs;
+
+  /// Recursively evaluate an expression to find constant value
+  std::optional<llvm::APSInt> evaluateConstant(const clang::Expr *expr,
+                                                clang::ASTContext &ctx);
+};
 
 /// Information about a kernel launch site (hipLaunchKernelGGL call)
 struct LaunchSiteInfo {
@@ -45,6 +79,8 @@ struct LaunchSiteInfo {
   clang::SourceRange sourceRange;               // Full range of the call
   const clang::Expr *gridExpr;                  // Grid dimension expression
   const clang::Expr *blockExpr;                 // Block dimension expression
+  std::set<unsigned> constantArgIndices;        // Which args are compile-time constants
+  std::map<unsigned, llvm::APSInt> constantArgValues;  // Constant values for folded args
 };
 
 /// Transforms HIP source code to insert kernel launch wrappers.
@@ -90,6 +126,8 @@ private:
   std::vector<LaunchSiteInfo> launchSites;
   std::map<std::string, bool> wrappersGenerated;  // Track which wrappers we've generated
   std::map<std::string, bool> kernelsNeedingConversion;  // Track kernels that need blockIdx→threadIdx
+  std::map<std::string, std::set<unsigned>> kernelConstantArgs;  // Track constant args per kernel
+  std::map<std::string, std::map<unsigned, llvm::APSInt>> kernelConstantArgValues;  // Constant values
 
   /// Analyze a kernel function
   KernelInfo analyzeKernel(const clang::FunctionDecl *FD);

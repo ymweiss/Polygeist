@@ -21,6 +21,157 @@ using namespace clang;
 
 namespace vortex {
 
+// Helper function to convert APSInt to std::string
+static std::string apIntToString(const llvm::APSInt &val) {
+  llvm::SmallString<32> str;
+  val.toString(str, 10);
+  return std::string(str.str());
+}
+
+//===----------------------------------------------------------------------===//
+// ConstantArgumentAnalyzer implementation
+//===----------------------------------------------------------------------===//
+
+void ConstantArgumentAnalyzer::clear() {
+  constantArgs.clear();
+}
+
+bool ConstantArgumentAnalyzer::isConstant(unsigned argIndex) const {
+  return constantArgs.count(argIndex) > 0;
+}
+
+std::optional<llvm::APSInt> ConstantArgumentAnalyzer::getConstantValue(unsigned argIndex) const {
+  auto it = constantArgs.find(argIndex);
+  if (it != constantArgs.end()) {
+    return it->second;
+  }
+  return std::nullopt;
+}
+
+std::set<unsigned> ConstantArgumentAnalyzer::getConstantArgIndices() const {
+  std::set<unsigned> result;
+  for (const auto &kv : constantArgs) {
+    result.insert(kv.first);
+  }
+  return result;
+}
+
+std::optional<llvm::APSInt> ConstantArgumentAnalyzer::evaluateConstant(
+    const Expr *expr, ASTContext &ctx) {
+  if (!expr)
+    return std::nullopt;
+
+  // Strip implicit casts and parens
+  expr = expr->IgnoreParenImpCasts();
+
+  // Integer literal
+  if (const auto *intLit = dyn_cast<IntegerLiteral>(expr)) {
+    llvm::APSInt val(intLit->getValue(), intLit->getType()->isUnsignedIntegerType());
+    return val;
+  }
+
+  // DeclRef to variable - check if it has a constant initializer
+  if (const auto *declRef = dyn_cast<DeclRefExpr>(expr)) {
+    if (const auto *varDecl = dyn_cast<VarDecl>(declRef->getDecl())) {
+      // Check for local variable with constant initializer
+      if (varDecl->hasInit()) {
+        const Expr *init = varDecl->getInit();
+
+        // Use Clang's constant evaluator
+        Expr::EvalResult result;
+        if (init->EvaluateAsInt(result, ctx)) {
+          return result.Val.getInt();
+        }
+
+        // Try evaluating the initializer recursively
+        auto constVal = evaluateConstant(init, ctx);
+        if (constVal) {
+          return constVal;
+        }
+      }
+    }
+  }
+
+  // Binary operations on constants
+  if (const auto *binOp = dyn_cast<BinaryOperator>(expr)) {
+    auto lhs = evaluateConstant(binOp->getLHS(), ctx);
+    auto rhs = evaluateConstant(binOp->getRHS(), ctx);
+    if (lhs && rhs) {
+      // Evaluate the operation
+      switch (binOp->getOpcode()) {
+        case BO_Add: return *lhs + *rhs;
+        case BO_Sub: return *lhs - *rhs;
+        case BO_Mul: return *lhs * *rhs;
+        case BO_Div:
+          if (*rhs != 0)
+            return *lhs / *rhs;
+          return std::nullopt;
+        case BO_Rem:
+          if (*rhs != 0)
+            return *lhs % *rhs;
+          return std::nullopt;
+        case BO_And: return *lhs & *rhs;
+        case BO_Or:  return *lhs | *rhs;
+        case BO_Xor: return *lhs ^ *rhs;
+        case BO_Shl: return *lhs << rhs->getExtValue();
+        case BO_Shr: return *lhs >> rhs->getExtValue();
+        default:
+          return std::nullopt;
+      }
+    }
+  }
+
+  // Unary operations
+  if (const auto *unaryOp = dyn_cast<UnaryOperator>(expr)) {
+    auto operand = evaluateConstant(unaryOp->getSubExpr(), ctx);
+    if (operand) {
+      switch (unaryOp->getOpcode()) {
+        case UO_Plus:  return *operand;
+        case UO_Minus: return -*operand;
+        case UO_Not:   return ~*operand;
+        case UO_LNot:  return llvm::APSInt(llvm::APInt(32, !*operand), false);
+        default:
+          return std::nullopt;
+      }
+    }
+  }
+
+  // Try Clang's general constant evaluator as fallback
+  Expr::EvalResult result;
+  if (expr->EvaluateAsInt(result, ctx)) {
+    return result.Val.getInt();
+  }
+
+  return std::nullopt;
+}
+
+void ConstantArgumentAnalyzer::analyzeLaunchSite(
+    const CUDAKernelCallExpr *launch, ASTContext &ctx) {
+  clear();
+
+  for (unsigned i = 0; i < launch->getNumArgs(); ++i) {
+    const Expr *arg = launch->getArg(i);
+
+    // Skip pointer arguments - they're never folded as constants
+    if (arg->getType()->isPointerType() ||
+        arg->getType()->isReferenceType() ||
+        arg->getType()->isArrayType()) {
+      continue;
+    }
+
+    // Try to evaluate as constant
+    if (auto constVal = evaluateConstant(arg, ctx)) {
+      constantArgs[i] = *constVal;
+      llvm::outs() << "[ConstantArgumentAnalyzer] Arg " << i
+                   << " is constant: " << apIntToString(*constVal) << "\n";
+    }
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// HIPSourceTransformer implementation
+//===----------------------------------------------------------------------===//
+
 HIPSourceTransformer::HIPSourceTransformer(ASTContext &ctx,
                                            SourceManager &SM,
                                            const LangOptions &LangOpts)
@@ -117,9 +268,57 @@ bool HIPSourceTransformer::VisitCUDAKernelCallExpr(CUDAKernelCallExpr *CE) {
     }
   }
 
+  // Analyze constant arguments at this launch site
+  ConstantArgumentAnalyzer analyzer;
+  analyzer.analyzeLaunchSite(CE, ctx);
+  site.constantArgIndices = analyzer.getConstantArgIndices();
+
+  // Store constant values
+  for (unsigned idx : site.constantArgIndices) {
+    if (auto val = analyzer.getConstantValue(idx)) {
+      site.constantArgValues[idx] = *val;
+    }
+  }
+
+  // Track constant args per kernel (for wrapper generation)
+  // We need to merge constant args from all launch sites for this kernel
+  if (kernelConstantArgs.find(site.kernelName) == kernelConstantArgs.end()) {
+    // First launch site - use its constant args
+    kernelConstantArgs[site.kernelName] = site.constantArgIndices;
+    kernelConstantArgValues[site.kernelName] = site.constantArgValues;
+  } else {
+    // Subsequent launch sites - only keep args that are constant in ALL sites
+    // with the SAME value (conservative approach)
+    auto &existingIndices = kernelConstantArgs[site.kernelName];
+    auto &existingValues = kernelConstantArgValues[site.kernelName];
+
+    std::set<unsigned> intersection;
+    for (unsigned idx : existingIndices) {
+      if (site.constantArgIndices.count(idx) > 0) {
+        // Check if values match
+        auto existingIt = existingValues.find(idx);
+        auto newIt = site.constantArgValues.find(idx);
+        if (existingIt != existingValues.end() && newIt != site.constantArgValues.end()) {
+          if (existingIt->second == newIt->second) {
+            intersection.insert(idx);
+          }
+        }
+      }
+    }
+
+    // Update to only keep consistently constant args
+    existingIndices = intersection;
+    std::map<unsigned, llvm::APSInt> filteredValues;
+    for (unsigned idx : intersection) {
+      filteredValues[idx] = existingValues[idx];
+    }
+    existingValues = filteredValues;
+  }
+
   launchSites.push_back(site);
   llvm::outs() << "[HIPSourceTransform] Found launch site for: "
-               << site.kernelName << "\n";
+               << site.kernelName << " with " << site.constantArgIndices.size()
+               << " constant arg(s)\n";
 
   return true;
 }
@@ -183,31 +382,76 @@ std::string HIPSourceTransformer::generateWrapperFunction(const KernelInfo &kern
   // Check if this kernel needs grid/block swap (blockIdx→threadIdx conversion)
   bool needsSwap = kernel.needsBlockIdxConversion();
 
-  // Build parameter list string: kernel args first, then grid/block dims
-  std::ostringstream paramList;
-  std::ostringstream argNames;
+  // Get constant args for this kernel (folded by MLIR)
+  const std::set<unsigned> &constArgs = kernelConstantArgs[kernel.demangledName];
+  const std::map<unsigned, llvm::APSInt> &constValues = kernelConstantArgValues[kernel.demangledName];
 
-  bool first = true;
-  for (const auto &arg : kernel.arguments) {
-    if (!first) {
-      paramList << ", ";
-      argNames << ", ";
+  if (!constArgs.empty()) {
+    llvm::outs() << "[HIPSourceTransform] Kernel " << kernel.demangledName
+                 << " has " << constArgs.size() << " constant arg(s) to fold\n";
+    for (unsigned idx : constArgs) {
+      auto it = constValues.find(idx);
+      if (it != constValues.end()) {
+        llvm::outs() << "  - Arg " << idx << " = " << apIntToString(it->second) << "\n";
+      }
     }
-    first = false;
+  }
+
+  // Build parameter list string: kernel args first (excluding constants), then grid/block dims
+  std::ostringstream paramList;
+  std::ostringstream argNamesForStub;  // Args passed to stub (non-constant only)
+  std::ostringstream argNamesForKernel;  // Args passed to kernel (with constants inlined)
+
+  bool firstParam = true;
+  bool firstStubArg = true;
+  bool firstKernelArg = true;
+
+  for (size_t i = 0; i < kernel.arguments.size(); ++i) {
+    const auto &arg = kernel.arguments[i];
+
+    // For kernel call args (DEVICE version): include all args, inlining constants
+    if (!firstKernelArg)
+      argNamesForKernel << ", ";
+    firstKernelArg = false;
+
+    if (constArgs.count(i) > 0) {
+      // This arg is constant - inline its value
+      auto it = constValues.find(i);
+      if (it != constValues.end()) {
+        argNamesForKernel << apIntToString(it->second);
+      } else {
+        argNamesForKernel << arg.name;  // Fallback
+      }
+    } else {
+      argNamesForKernel << arg.name;
+    }
+
+    // For wrapper params and stub args: exclude constants
+    if (constArgs.count(i) > 0)
+      continue;
+
+    if (!firstParam)
+      paramList << ", ";
+    firstParam = false;
+
+    if (!firstStubArg)
+      argNamesForStub << ", ";
+    firstStubArg = false;
 
     // Get type string from the original declaration
     PrintingPolicy policy(ctx.getLangOpts());
     paramList << arg.type.getAsString(policy) << " " << arg.name;
-    argNames << arg.name;
+    argNamesForStub << arg.name;
   }
 
   // Add grid and block parameters
-  if (!kernel.arguments.empty())
+  if (!firstParam)
     paramList << ", ";
   paramList << "dim3 __grid, dim3 __block";
 
   std::string params = paramList.str();
-  std::string args = argNames.str();
+  std::string stubArgs = argNamesForStub.str();
+  std::string kernelArgs = argNamesForKernel.str();
 
   // Determine grid/block args for the launch (swap if needed)
   std::string gridArg = needsSwap ? "__block" : "__grid";
@@ -218,21 +462,34 @@ std::string HIPSourceTransformer::generateWrapperFunction(const KernelInfo &kern
   if (needsSwap) {
     os << "// NOTE: blockIdx→threadIdx conversion - grid/block dimensions swapped\n";
   }
+  if (!constArgs.empty()) {
+    os << "// NOTE: " << constArgs.size() << " constant arg(s) folded (matching MLIR constant folding)\n";
+    for (unsigned idx : constArgs) {
+      auto it = constValues.find(idx);
+      if (it != constValues.end()) {
+        os << "//   Arg " << idx << " (" << kernel.arguments[idx].name
+           << ") = " << apIntToString(it->second) << "\n";
+      }
+    }
+  }
   os << "// On host: calls generated stub for proper argument marshaling\n";
   os << "// On device: uses <<<>>> syntax for Polygeist processing\n";
   os << "#ifdef HIP_HOST_COMPILATION\n";
 
   // HOST version: call the generated stub function which uses vortexLaunchKernel
   os << "__attribute__((noinline)) void " << wrapperName << "(" << params << ") {\n";
-  os << "    " << stubName << "(" << gridArg << ", " << blockArg << ", " << args << ");\n";
+  os << "    " << stubName << "(" << gridArg << ", " << blockArg;
+  if (!stubArgs.empty())
+    os << ", " << stubArgs;
+  os << ");\n";
   os << "}\n";
 
   os << "#else\n";
 
   // DEVICE version: use kernel launch syntax for Polygeist/MLIR processing
-  // Use swapped grid/block if this kernel had blockIdx→threadIdx conversion
+  // Note: We inline constants here too so MLIR can fold them
   os << "__attribute__((noinline)) void " << wrapperName << "(" << params << ") {\n";
-  os << "    " << kernel.demangledName << "<<<" << gridArg << ", " << blockArg << ">>>(" << args << ");\n";
+  os << "    " << kernel.demangledName << "<<<" << gridArg << ", " << blockArg << ">>>(" << kernelArgs << ");\n";
   os << "}\n";
 
   os << "#endif\n\n";
@@ -323,13 +580,20 @@ std::string HIPSourceTransformer::generateWrapperCall(const LaunchSiteInfo &site
     }
   }
 
-  // Add kernel arguments
+  // Get constant args for this kernel (to skip them)
+  const std::set<unsigned> &constArgs = kernelConstantArgs[site.kernelName];
+
+  // Add kernel arguments (skipping constant args)
   bool first = true;
-  for (const auto &arg : kernelArgs) {
+  for (size_t i = 0; i < kernelArgs.size(); ++i) {
+    // Skip constant args - they're folded into the wrapper
+    if (constArgs.count(i) > 0)
+      continue;
+
     if (!first)
       os << ", ";
     first = false;
-    os << arg;
+    os << kernelArgs[i];
   }
 
   // Add grid and block arguments
@@ -573,6 +837,7 @@ bool HIPSourceTransformer::writeToFile(llvm::StringRef filename) const {
 bool HIPSourceTransformer::writeStubHeader(llvm::StringRef outputDir) const {
   // Generate stub headers for each kernel
   // This creates the _args.h with CORRECT argument order from AST
+  // Constant args are EXCLUDED (matching MLIR constant folding)
   for (const auto &kernel : kernels) {
     std::string stubName = kernel.demangledName + "_args.h";
     std::string stubPath;
@@ -590,12 +855,44 @@ bool HIPSourceTransformer::writeStubHeader(llvm::StringRef outputDir) const {
       continue;
     }
 
+    // Get constant args for this kernel
+    std::set<unsigned> constArgs;
+    std::map<unsigned, llvm::APSInt> constValues;
+    {
+      auto it = kernelConstantArgs.find(kernel.demangledName);
+      if (it != kernelConstantArgs.end()) {
+        constArgs = it->second;
+      }
+      auto valIt = kernelConstantArgValues.find(kernel.demangledName);
+      if (valIt != kernelConstantArgValues.end()) {
+        constValues = valIt->second;
+      }
+    }
+
+    // Count non-constant args
+    unsigned nonConstArgCount = 0;
+    for (size_t i = 0; i < kernel.arguments.size(); ++i) {
+      if (constArgs.count(i) == 0) {
+        nonConstArgCount++;
+      }
+    }
+
     std::string guardName = kernel.demangledName + "_ARGS_H";
     std::transform(guardName.begin(), guardName.end(), guardName.begin(), ::toupper);
 
     out << "// Auto-generated host stub for " << kernel.demangledName << "\n";
     out << "// Generated by Polygeist HIPSourceTransform from HIP AST\n";
-    out << "// Arguments in ORIGINAL order from HIP source (pointers first if applicable)\n";
+    out << "// Arguments in ORIGINAL order from HIP source (constant args excluded)\n";
+    if (!constArgs.empty()) {
+      out << "// Constant args folded (matching MLIR):\n";
+      for (unsigned idx : constArgs) {
+        auto it = constValues.find(idx);
+        if (it != constValues.end()) {
+          out << "//   Arg " << idx << " (" << kernel.arguments[idx].name
+              << ") = " << apIntToString(it->second) << "\n";
+        }
+      }
+    }
     out << "#ifndef " << guardName << "\n";
     out << "#define " << guardName << "\n\n";
     out << "#include <stdint.h>\n\n";
@@ -604,12 +901,16 @@ bool HIPSourceTransformer::writeStubHeader(llvm::StringRef outputDir) const {
     out << "#error \"" << stubName << " must be included after hip_vortex_runtime.h\"\n";
     out << "#endif\n\n";
 
-    // Generate argument structure with ORIGINAL order from HIP source
+    // Generate argument structure with non-constant args only
     out << "// Argument structure for " << kernel.demangledName << "\n";
     out << "typedef struct __attribute__((packed)) {\n";
 
     unsigned offset = 0;
     for (size_t i = 0; i < kernel.arguments.size(); ++i) {
+      // Skip constant args
+      if (constArgs.count(i) > 0)
+        continue;
+
       const auto &arg = kernel.arguments[i];
       // Align offset
       unsigned alignedOffset = (offset + arg.alignBytes - 1) & ~(arg.alignBytes - 1);
@@ -630,12 +931,16 @@ bool HIPSourceTransformer::writeStubHeader(llvm::StringRef outputDir) const {
 
     out << "} " << kernel.demangledName << "_args_t;\n\n";
 
-    // Generate metadata array
+    // Generate metadata array (non-constant args only)
     out << "// Metadata array for vortexLaunchKernel\n";
     out << "static const VortexKernelArgMeta " << kernel.demangledName << "_metadata[] = {\n";
 
     offset = 0;
     for (size_t i = 0; i < kernel.arguments.size(); ++i) {
+      // Skip constant args
+      if (constArgs.count(i) > 0)
+        continue;
+
       const auto &arg = kernel.arguments[i];
       unsigned alignedOffset = (offset + arg.alignBytes - 1) & ~(arg.alignBytes - 1);
       unsigned size = arg.isPointer ? 8 : arg.sizeBytes;
@@ -649,14 +954,19 @@ bool HIPSourceTransformer::writeStubHeader(llvm::StringRef outputDir) const {
     }
 
     out << "};\n";
-    out << "#define " << kernel.demangledName << "_NUM_ARGS " << kernel.arguments.size() << "\n\n";
+    out << "#define " << kernel.demangledName << "_NUM_ARGS " << nonConstArgCount << "\n\n";
 
-    // Generate type-safe launcher
+    // Generate type-safe launcher (non-constant args only)
     out << "// Type-safe launcher (use this instead of hipLaunchKernelGGL)\n";
     out << "static inline hipError_t launch_" << kernel.demangledName << "(\n";
     out << "    dim3 gridDim, dim3 blockDim";
 
-    for (const auto &arg : kernel.arguments) {
+    for (size_t i = 0; i < kernel.arguments.size(); ++i) {
+      // Skip constant args
+      if (constArgs.count(i) > 0)
+        continue;
+
+      const auto &arg = kernel.arguments[i];
       out << ",\n    ";
       if (arg.isPointer) {
         out << "const void* " << arg.name;
@@ -669,7 +979,12 @@ bool HIPSourceTransformer::writeStubHeader(llvm::StringRef outputDir) const {
     out << ") {\n\n";
     out << "  " << kernel.demangledName << "_args_t args;\n";
 
-    for (const auto &arg : kernel.arguments) {
+    for (size_t i = 0; i < kernel.arguments.size(); ++i) {
+      // Skip constant args
+      if (constArgs.count(i) > 0)
+        continue;
+
+      const auto &arg = kernel.arguments[i];
       if (arg.isPointer) {
         out << "  args." << arg.name << " = (void*)" << arg.name << ";\n";
       } else {
@@ -688,6 +1003,10 @@ bool HIPSourceTransformer::writeStubHeader(llvm::StringRef outputDir) const {
     out << "#endif // " << guardName << "\n";
 
     llvm::outs() << "[HIPSourceTransform] Written stub header: " << stubPath << "\n";
+    if (!constArgs.empty()) {
+      llvm::outs() << "[HIPSourceTransform] Stub has " << nonConstArgCount
+                   << " args (excluded " << constArgs.size() << " constant arg(s))\n";
+    }
   }
 
   return !kernels.empty();
