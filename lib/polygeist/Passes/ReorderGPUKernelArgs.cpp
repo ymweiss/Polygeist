@@ -381,16 +381,38 @@ static std::string extractKernelNameFromWrapper(StringRef wrapperName) {
   // Skip "__launch_" prefix
   StringRef afterLaunch = wrapperName.substr(pos + 9);
 
-  // The kernel name continues until a type suffix (capital letter or digit after underscore)
-  // Or until "Pf", "Pi", "4dim3", etc.
-  // Simple heuristic: find common suffixes
-  size_t endPos = afterLaunch.find("Pf");  // pointer to float
-  if (endPos == StringRef::npos) endPos = afterLaunch.find("Pi");  // pointer to int
-  if (endPos == StringRef::npos) endPos = afterLaunch.find("Pc");  // pointer to char
-  if (endPos == StringRef::npos) endPos = afterLaunch.find("4dim3");  // dim3 type
-  if (endPos == StringRef::npos) endPos = afterLaunch.find("j");  // uint32_t
-  if (endPos == StringRef::npos) endPos = afterLaunch.find("i");  // int32_t
-  if (endPos == StringRef::npos) endPos = afterLaunch.size();
+  // The kernel name continues until a type suffix in the mangled name.
+  // Find the EARLIEST occurrence of any type suffix.
+  // We focus on pointer types (P prefix) as they're unambiguous.
+  size_t endPos = afterLaunch.size();
+
+  // Helper to update endPos to the earliest position
+  auto updateEndPos = [&](size_t pos) {
+    if (pos != StringRef::npos && pos < endPos)
+      endPos = pos;
+  };
+
+  // Check pointer types (P followed by type code) - these are unambiguous
+  updateEndPos(afterLaunch.find("Pf"));  // pointer to float
+  updateEndPos(afterLaunch.find("Pd"));  // pointer to double
+  updateEndPos(afterLaunch.find("Pi"));  // pointer to int
+  updateEndPos(afterLaunch.find("Pj"));  // pointer to uint32_t
+  updateEndPos(afterLaunch.find("Pl"));  // pointer to long
+  updateEndPos(afterLaunch.find("Pm"));  // pointer to unsigned long (uint64_t)
+  updateEndPos(afterLaunch.find("Px"));  // pointer to long long
+  updateEndPos(afterLaunch.find("Py"));  // pointer to unsigned long long
+  updateEndPos(afterLaunch.find("Pc"));  // pointer to char
+  updateEndPos(afterLaunch.find("Ph"));  // pointer to unsigned char
+  updateEndPos(afterLaunch.find("Ps"));  // pointer to short
+  updateEndPos(afterLaunch.find("Pt"));  // pointer to unsigned short
+  updateEndPos(afterLaunch.find("Pv"));  // pointer to void
+  updateEndPos(afterLaunch.find("PP")); // pointer to pointer
+  updateEndPos(afterLaunch.find("PK")); // pointer to const
+  // Check struct/class types (digit followed by name)
+  updateEndPos(afterLaunch.find("4dim3"));  // dim3 type
+  updateEndPos(afterLaunch.find("S_"));  // substitution
+  updateEndPos(afterLaunch.find("S0_")); // substitution 0
+  updateEndPos(afterLaunch.find("S1_")); // substitution 1
 
   return afterLaunch.substr(0, endPos).str();
 }
