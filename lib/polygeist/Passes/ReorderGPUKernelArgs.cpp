@@ -114,22 +114,11 @@ static bool reorderGPUKernelArguments(
 
   auto argTypes = gpuFunc.getArgumentTypes();
 
-  // GPU kernel has internal args (index, i32) before user args
-  unsigned numLeadingScalars = 0;
-  for (auto argType : argTypes) {
-    if (argType.isa<MemRefType>() || argType.isa<LLVM::LLVMPointerType>())
-      break;
-    ++numLeadingScalars;
-  }
-
-  // Skip first 2 internal args (derived from block_dim)
-  unsigned argsToSkip = (numLeadingScalars >= 2) ? 2 : 0;
-
   // Count trailing synthetic args (not user args):
   // - !llvm.ptr: captured globals (e.g., printf format strings)
   // - index: loop bounds that Polygeist hoists into kernel parameters
   unsigned numTrailingSynthetic = 0;
-  for (int i = argTypes.size() - 1; i >= (int)argsToSkip; --i) {
+  for (int i = argTypes.size() - 1; i >= 0; --i) {
     Type argType = argTypes[i];
     if (argType.isa<LLVM::LLVMPointerType>() || argType.isa<IndexType>()) {
       numTrailingSynthetic++;
@@ -138,6 +127,8 @@ static bool reorderGPUKernelArguments(
     }
   }
 
+  // All non-synthetic args are user args (no internal args to skip)
+  unsigned argsToSkip = 0;
   unsigned numUserArgs = argTypes.size() - argsToSkip - numTrailingSynthetic;
 
   if (numUserArgs != originalIsPointer.size()) {
@@ -486,29 +477,25 @@ struct ReorderGPUKernelArgsPass
                      << gpuFuncName << "\n";
 
         // Calculate number of user args in gpu.func
-        // GPU kernel has internal args (block_dim derived) before user args
-        // Also exclude trailing !llvm.ptr args which are captured globals (e.g., printf format strings)
+        // All args are user args except:
+        // - Trailing !llvm.ptr: captured globals (e.g., printf format strings)
+        // - Trailing index: loop bounds that Polygeist hoists into kernel parameters
         auto argTypes = gpuFunc.getArgumentTypes();
-        unsigned numLeadingScalars = 0;
-        for (auto argType : argTypes) {
-          if (argType.isa<MemRefType>() || argType.isa<LLVM::LLVMPointerType>())
-            break;
-          ++numLeadingScalars;
-        }
-        unsigned argsToSkip = (numLeadingScalars >= 2) ? 2 : 0;
 
-        // Count synthetic args (not user args):
-        // - !llvm.ptr: captured globals (e.g., printf format strings)
-        // - index: loop bounds that Polygeist hoists into kernel parameters
-        // These can appear anywhere in the signature, not just at the end
+        // Count synthetic args from the END (they're appended by Polygeist)
+        // Synthetic args are: llvm.ptr (globals) or index (loop bounds)
         unsigned numSyntheticArgs = 0;
-        for (unsigned i = argsToSkip; i < argTypes.size(); ++i) {
+        for (int i = argTypes.size() - 1; i >= 0; --i) {
           Type argType = argTypes[i];
           if (argType.isa<LLVM::LLVMPointerType>() || argType.isa<IndexType>()) {
             numSyntheticArgs++;
+          } else {
+            break;  // Stop at first non-synthetic from the end
           }
         }
 
+        // All non-synthetic args are user args (no internal args to skip)
+        unsigned argsToSkip = 0;
         unsigned numGpuUserArgs = argTypes.size() - argsToSkip - numSyntheticArgs;
 
         llvm::outs() << "[ReorderGPUKernelArgs]   gpu.func has " << numGpuUserArgs

@@ -14,8 +14,10 @@
 #include "mlir/IR/Dominance.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "mlir/Transforms/RegionUtils.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/SetVector.h"
 
 using namespace mlir;
 
@@ -43,17 +45,42 @@ struct SinkIndexCastsIntoGPULaunchPass
     Operation *op = getOperation();
     bool changed = true;
 
+    llvm::outs() << "[SinkIndexCasts] Starting pass\n";
+
     // Iterate until no more changes
     while (changed) {
       changed = false;
 
       // Walk all gpu.launch operations
       op->walk([&](gpu::LaunchOp launchOp) {
+        llvm::outs() << "[SinkIndexCasts] Found gpu.launch\n";
         // Collect index_cast operations that can be sunk
         llvm::SmallVector<arith::IndexCastOp, 8> castsToSink;
         Region &launchBody = launchOp.getBody();
 
-        // Find all arith.index_cast ops outside the launch whose results are used inside
+        // Debug: show what values would be captured
+        llvm::SetVector<Value> capturedValues;
+        mlir::getUsedValuesDefinedAbove(launchBody, capturedValues);
+        llvm::outs() << "[SinkIndexCasts] Captured values: " << capturedValues.size() << "\n";
+        for (Value v : capturedValues) {
+          if (auto castOp = v.getDefiningOp<arith::IndexCastOp>()) {
+            llvm::outs() << "[SinkIndexCasts]   - index_cast result, source type: "
+                         << castOp.getIn().getType() << "\n";
+            // This is a candidate for sinking!
+            Value source = castOp.getIn();
+            bool sourceAlsoCaptured = capturedValues.contains(source);
+            llvm::outs() << "[SinkIndexCasts]     source also captured: "
+                         << (sourceAlsoCaptured ? "yes" : "no") << "\n";
+            if (sourceAlsoCaptured) {
+              // Both the cast result AND its source are captured - we should sink the cast
+              castsToSink.push_back(castOp);
+            }
+          } else if (v.getType().isIndex()) {
+            llvm::outs() << "[SinkIndexCasts]   - index value (not from cast)\n";
+          }
+        }
+
+        // Also check inside the launch body for casts that could be sunk
         for (Block &block : launchBody) {
           for (Operation &innerOp : block) {
             for (Value operand : innerOp.getOperands()) {
@@ -61,7 +88,6 @@ struct SinkIndexCastsIntoGPULaunchPass
                 // The cast is outside the launch
                 if (!launchOp->isAncestor(castOp)) {
                   // Check if the source of the cast is also used in the launch
-                  // (This would mean both the cast result and source are captured)
                   Value source = castOp.getIn();
                   bool sourceUsedInLaunch = false;
                   for (Operation *user : source.getUsers()) {
@@ -70,9 +96,6 @@ struct SinkIndexCastsIntoGPULaunchPass
                       break;
                     }
                   }
-
-                  // Also check if source is passed as a block argument
-                  // (it would be captured for the launch)
 
                   // We sink the cast if it's only used in this launch
                   // and has no other uses outside
@@ -84,7 +107,11 @@ struct SinkIndexCastsIntoGPULaunchPass
                     }
                   }
 
-                  if (onlyUsedInThisLaunch) {
+                  llvm::outs() << "[SinkIndexCasts] Found cast candidate: "
+                               << "sourceUsedInLaunch=" << sourceUsedInLaunch
+                               << ", onlyUsedInThisLaunch=" << onlyUsedInThisLaunch << "\n";
+
+                  if (onlyUsedInThisLaunch && !llvm::is_contained(castsToSink, castOp)) {
                     castsToSink.push_back(castOp);
                   }
                 }
