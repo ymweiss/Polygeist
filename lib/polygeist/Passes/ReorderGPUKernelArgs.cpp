@@ -114,38 +114,54 @@ static bool reorderGPUKernelArguments(
 
   auto argTypes = gpuFunc.getArgumentTypes();
 
+  // Count leading synthetic args (thread count indices):
+  // - index: total thread count or loop bounds hoisted into kernel parameters
+  unsigned numLeadingSynthetic = 0;
+  for (unsigned i = 0; i < argTypes.size(); ++i) {
+    Type argType = argTypes[i];
+    if (argType.isa<IndexType>()) {
+      numLeadingSynthetic++;
+    } else {
+      break;  // Stop at first non-index arg from the front
+    }
+  }
+
   // Count trailing synthetic args (not user args):
   // - !llvm.ptr: captured globals (e.g., printf format strings)
-  // - index: loop bounds that Polygeist hoists into kernel parameters
+  // - index: loop bounds that Polygeist hoists into kernel parameters (already counted above)
   unsigned numTrailingSynthetic = 0;
-  for (int i = argTypes.size() - 1; i >= 0; --i) {
+  for (int i = argTypes.size() - 1; i >= (int)(numLeadingSynthetic); --i) {
     Type argType = argTypes[i];
-    if (argType.isa<LLVM::LLVMPointerType>() || argType.isa<IndexType>()) {
+    if (argType.isa<LLVM::LLVMPointerType>()) {
       numTrailingSynthetic++;
     } else {
       break;  // Stop at first non-synthetic arg from the end
     }
   }
 
-  // All non-synthetic args are user args (no internal args to skip)
-  unsigned argsToSkip = 0;
-  unsigned numUserArgs = argTypes.size() - argsToSkip - numTrailingSynthetic;
+  // User args are between leading and trailing synthetic args
+  unsigned argsToSkip = numLeadingSynthetic;
+  unsigned numUserArgs = argTypes.size() - numLeadingSynthetic - numTrailingSynthetic;
 
   if (numUserArgs != originalIsPointer.size()) {
     llvm::errs() << "Warning: Argument count mismatch for reordering "
                  << gpuFunc.getName() << " - expected " << originalIsPointer.size()
                  << " user args, got " << numUserArgs
-                 << " (synthetic: " << numTrailingSynthetic << ")\n";
+                 << " (leading synthetic: " << numLeadingSynthetic
+                 << ", trailing synthetic: " << numTrailingSynthetic << ")\n";
     return false;
   }
 
-  // Compute permutation: deviceToOriginal[device_idx] = original_idx
-  auto deviceToOriginal = computeArgPermutation(originalIsPointer);
-
-  // Check if reordering is needed
+  // Check if reordering is actually needed by comparing actual GPU arg types
+  // with the wrapper arg types in order.
+  // We DON'T assume Polygeist reorders - we check the actual types.
   bool needsReorder = false;
   for (unsigned i = 0; i < numUserArgs; ++i) {
-    if (deviceToOriginal[i] != i) {
+    Type gpuArgType = argTypes[argsToSkip + i];
+    bool gpuIsPtr = gpuArgType.isa<MemRefType>();
+    bool wrapperIsPtr = originalIsPointer[i];
+
+    if (gpuIsPtr != wrapperIsPtr) {
       needsReorder = true;
       break;
     }
@@ -153,6 +169,10 @@ static bool reorderGPUKernelArguments(
 
   if (!needsReorder)
     return false;
+
+  // Compute permutation: deviceToOriginal[device_idx] = original_idx
+  // This is only used if we actually need to reorder.
+  auto deviceToOriginal = computeArgPermutation(originalIsPointer);
 
   // Compute inverse: originalToDevice[original_idx] = device_idx
   std::vector<unsigned> originalToDevice(numUserArgs);
@@ -329,6 +349,21 @@ static bool reorderGPUKernelArguments(
     }
   });
 
+  // After reordering, the kernel args are in wrapper order.
+  // Set the kernel_arg_mapping to identity: kernel arg i -> host arg i
+  SmallVector<int64_t> identityMapping;
+  for (unsigned i = 0; i < argTypes.size(); ++i) {
+    if (i < argsToSkip || i >= argTypes.size() - numTrailingSynthetic) {
+      // Synthetic args (leading index or trailing llvm.ptr)
+      identityMapping.push_back(-1);
+    } else {
+      // User args now in identity order
+      identityMapping.push_back(static_cast<int64_t>(i - argsToSkip));
+    }
+  }
+  clonedFunc->setAttr("kernel_arg_mapping",
+                       DenseI64ArrayAttr::get(clonedFunc.getContext(), identityMapping));
+
   llvm::outs() << "Reordered kernel arguments: " << funcNameStr << "\n";
   return true;
 }
@@ -500,29 +535,41 @@ struct ReorderGPUKernelArgsPass
 
         // Calculate number of user args in gpu.func
         // All args are user args except:
+        // - Leading index: thread count or loop bounds hoisted into kernel parameters
         // - Trailing !llvm.ptr: captured globals (e.g., printf format strings)
-        // - Trailing index: loop bounds that Polygeist hoists into kernel parameters
         auto argTypes = gpuFunc.getArgumentTypes();
 
-        // Count synthetic args from the END (they're appended by Polygeist)
-        // Synthetic args are: llvm.ptr (globals) or index (loop bounds)
-        unsigned numSyntheticArgs = 0;
-        for (int i = argTypes.size() - 1; i >= 0; --i) {
+        // Count leading synthetic args (index types at the front)
+        unsigned numLeadingSynthetic = 0;
+        for (unsigned i = 0; i < argTypes.size(); ++i) {
           Type argType = argTypes[i];
-          if (argType.isa<LLVM::LLVMPointerType>() || argType.isa<IndexType>()) {
-            numSyntheticArgs++;
+          if (argType.isa<IndexType>()) {
+            numLeadingSynthetic++;
           } else {
-            break;  // Stop at first non-synthetic from the end
+            break;  // Stop at first non-index arg from the front
           }
         }
 
-        // All non-synthetic args are user args (no internal args to skip)
-        unsigned argsToSkip = 0;
-        unsigned numGpuUserArgs = argTypes.size() - argsToSkip - numSyntheticArgs;
+        // Count trailing synthetic args (llvm.ptr at the end)
+        unsigned numTrailingSynthetic = 0;
+        for (int i = argTypes.size() - 1; i >= (int)numLeadingSynthetic; --i) {
+          Type argType = argTypes[i];
+          if (argType.isa<LLVM::LLVMPointerType>()) {
+            numTrailingSynthetic++;
+          } else {
+            break;  // Stop at first non-ptr from the end
+          }
+        }
+
+        // User args are between leading and trailing synthetic args
+        unsigned argsToSkip = numLeadingSynthetic;
+        unsigned numSyntheticArgs = numLeadingSynthetic + numTrailingSynthetic;
+        unsigned numGpuUserArgs = argTypes.size() - numSyntheticArgs;
 
         llvm::outs() << "[ReorderGPUKernelArgs]   gpu.func has " << numGpuUserArgs
                      << " user args (total: " << argTypes.size()
-                     << ", synthetic: " << numSyntheticArgs << ")\n";
+                     << ", leading synthetic: " << numLeadingSynthetic
+                     << ", trailing synthetic: " << numTrailingSynthetic << ")\n";
 
         // Try to match gpu.func name to wrapper's kernel name
         // 1. Try exact match first
@@ -589,7 +636,123 @@ struct ReorderGPUKernelArgsPass
                          << numSyntheticArgs << " on " << gpuFuncName << "\n";
           }
 
-          reorderGPUKernelArguments(gpuModule, gpuFunc, it->second, module);
+          // Update kernel_arg_mapping to reflect synthetic vs user args.
+          // This is critical for GenerateVortexMain to correctly load user args.
+          //
+          // Polygeist reorders args: scalars first, then pointers.
+          // It may also add synthetic scalar args (e.g., total_threads for bounds checking).
+          // Synthetic scalars appear AFTER user scalars in the scalar block.
+          //
+          // Example for mstress:
+          // - Wrapper args (original): addr_ptr(0), src_ptr(1), dst_ptr(2), stride(3)
+          // - Wrapper isPointer: [true, true, true, false] => 1 scalar, 3 pointers
+          // - GPU kernel args: (i32, i32, memref, memref, memref) => 2 scalars, 3 pointers
+          // - Extra scalar = synthetic. User scalar comes first.
+          // - Expected mapping: [3, -1, 0, 1, 2]
+
+          const auto& wrapperIsPointer = it->second;
+
+          // Count wrapper scalars and pointers
+          unsigned numWrapperScalars = 0;
+          unsigned numWrapperPointers = 0;
+          for (bool isPtr : wrapperIsPointer) {
+            if (isPtr) numWrapperPointers++;
+            else numWrapperScalars++;
+          }
+
+          // Count GPU kernel scalar args at the front (before memrefs)
+          unsigned numGpuScalars = 0;
+          for (unsigned i = 0; i < argTypes.size(); ++i) {
+            Type argType = argTypes[i];
+            if (argType.isa<MemRefType>() || argType.isa<LLVM::LLVMPointerType>()) {
+              break;  // Hit first pointer/memref type
+            }
+            numGpuScalars++;
+          }
+
+          // Synthetic scalars = GPU scalars - wrapper scalars
+          unsigned numSyntheticScalars = 0;
+          if (numGpuScalars > numWrapperScalars) {
+            numSyntheticScalars = numGpuScalars - numWrapperScalars;
+          }
+
+          llvm::outs() << "[ReorderGPUKernelArgs]   wrapper: " << numWrapperScalars
+                       << " scalars, " << numWrapperPointers << " pointers\n";
+          llvm::outs() << "[ReorderGPUKernelArgs]   GPU: " << numGpuScalars
+                       << " leading scalars, " << numSyntheticScalars << " synthetic\n";
+
+          // Build the kernel_arg_mapping by checking the ACTUAL type at each position.
+          // Don't assume Polygeist reordered args - it may or may not have.
+          //
+          // The wrapper has args in the original HIP order.
+          // We need to map each GPU kernel arg to the corresponding wrapper arg index.
+          //
+          // Strategy:
+          // - Count scalars and pointers encountered so far in the GPU kernel
+          // - Map each GPU arg to the Nth occurrence in wrapper of that type
+
+          SmallVector<int64_t> newMapping(argTypes.size(), -1);
+
+          // Build lists of wrapper scalar and pointer indices (in wrapper order)
+          SmallVector<unsigned> wrapperScalarIndices;
+          SmallVector<unsigned> wrapperPointerIndices;
+          for (unsigned i = 0; i < wrapperIsPointer.size(); ++i) {
+            if (wrapperIsPointer[i]) {
+              wrapperPointerIndices.push_back(i);
+            } else {
+              wrapperScalarIndices.push_back(i);
+            }
+          }
+
+          unsigned scalarsSeen = 0;
+          unsigned pointersSeen = 0;
+
+          for (unsigned i = 0; i < argTypes.size(); ++i) {
+            if (i >= argTypes.size() - numTrailingSynthetic) {
+              // Trailing synthetic args (llvm.ptr) stay as -1
+              newMapping[i] = -1;
+            } else if (i < numLeadingSynthetic) {
+              // Leading synthetic args (index types) stay as -1
+              newMapping[i] = -1;
+            } else {
+              // User args - check actual type
+              Type argType = argTypes[i];
+              bool isPtr = argType.isa<MemRefType>();
+
+              if (isPtr) {
+                // Pointer arg - map to next available wrapper pointer
+                if (pointersSeen < wrapperPointerIndices.size()) {
+                  newMapping[i] = wrapperPointerIndices[pointersSeen++];
+                } else {
+                  newMapping[i] = -1;  // Extra pointer = synthetic
+                }
+              } else {
+                // Scalar arg - map to next available wrapper scalar
+                if (scalarsSeen < wrapperScalarIndices.size()) {
+                  newMapping[i] = wrapperScalarIndices[scalarsSeen++];
+                } else {
+                  newMapping[i] = -1;  // Extra scalar = synthetic
+                }
+              }
+            }
+          }
+
+          // Try to reorder the GPU kernel args to match wrapper order
+          bool didReorder = reorderGPUKernelArguments(gpuModule, gpuFunc, it->second, module);
+
+          // If reordering happened, the identity mapping was set inside reorderGPUKernelArguments
+          // on the cloned function (gpuFunc is now invalid/erased).
+          // If no reordering, set the computed mapping on the original gpuFunc.
+          if (!didReorder) {
+            gpuFunc->setAttr("kernel_arg_mapping",
+                             DenseI64ArrayAttr::get(gpuFunc.getContext(), newMapping));
+            llvm::outs() << "[ReorderGPUKernelArgs] Updated kernel_arg_mapping: [";
+            for (size_t i = 0; i < newMapping.size(); ++i) {
+              if (i > 0) llvm::outs() << ", ";
+              llvm::outs() << newMapping[i];
+            }
+            llvm::outs() << "]\n";
+          }
         } else {
           llvm::outs() << "[ReorderGPUKernelArgs] No matching wrapper for "
                        << gpuFuncName << " (has " << numGpuUserArgs << " user args)\n";
