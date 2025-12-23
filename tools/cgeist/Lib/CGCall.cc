@@ -86,8 +86,6 @@ ValueCategory MLIRScanner::CallHelper(
     mlir::func::FuncOp tocall, QualType objType,
     ArrayRef<std::pair<ValueCategory, clang::Expr *>> arguments,
     QualType retType, bool retReference, clang::Expr *expr) {
-  llvm::errs() << "[CallHelper] called for: " << tocall.getName()
-               << ", expr class: " << expr->getStmtClassName() << "\n";
   SmallVector<mlir::Value, 4> args;
   auto fnType = tocall.getFunctionType();
 
@@ -353,12 +351,6 @@ ValueCategory MLIRScanner::CallHelper(
         /*dependencies*/ asyncDependencies);
 
     // If this is a __global__ kernel, attach Vortex metadata for argument marshalling
-    llvm::errs() << "[CGCall] kernelFD=" << (kernelFD ? "present" : "null");
-    if (kernelFD) {
-      llvm::errs() << ", name=" << kernelFD->getNameAsString()
-                   << ", hasCUDAGlobalAttr=" << kernelFD->hasAttr<CUDAGlobalAttr>();
-    }
-    llvm::errs() << "\n";
     if (kernelFD && kernelFD->hasAttr<CUDAGlobalAttr>()) {
       // Copy vortex metadata from the kernel function to the gpu.launch operation
       if (auto kernelArgsAttr = tocall->getAttr("vortex.kernel_args")) {
@@ -370,8 +362,6 @@ ValueCategory MLIRScanner::CallHelper(
       // Store the unmangled kernel name - this must match what hipLaunchKernelGGL macro sees
       std::string kernelName = kernelFD->getNameAsString();
       op->setAttr("vortex.kernel_name", builder.getStringAttr(kernelName));
-      llvm::errs() << "[CGCall] Set vortex.kernel_name='" << kernelName
-                   << "' on gpu.launch\n";
 
       // Record the original argument types in order for kernel outlining to use
       // when sorting operands back to the correct order. This survives inlining

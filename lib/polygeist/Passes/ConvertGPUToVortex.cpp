@@ -1142,14 +1142,14 @@ static void emitKernelMetadata(gpu::GPUFuncOp funcOp, StringRef outputDir) {
           userArgIndices.push_back(i);
         }
       } else {
-        int64_t maxUserArgIdx = maxHostIdx - 2;
+        // Trust the mapping: if mapping[i] >= 0, it's a valid user arg.
+        // Don't assume grid/block dims are at the end - they may have been
+        // specialized away by Polygeist (e.g., in main_kernel with constant dims).
         llvm::SmallSet<int64_t, 8> seenHostArgs;
         for (unsigned i = 0; i < mapping.size() && i < effectiveTotalArgs; ++i) {
           int64_t hostIdx = mapping[i];
-          // Include arg if:
-          // 1. It's a valid user arg (traced from host wrapper), OR
-          // 2. It's an index-type synthetic arg (loop bound - needs buffer space)
-          if (hostIdx >= 0 && hostIdx <= maxUserArgIdx) {
+          // Include arg if it has a valid mapping (non-negative means user arg)
+          if (hostIdx >= 0) {
             if (seenHostArgs.insert(hostIdx).second) {
               userArgIndices.push_back(i);
             }

@@ -70,11 +70,21 @@ std::optional<llvm::APSInt> ConstantArgumentAnalyzer::evaluateConstant(
     return val;
   }
 
-  // DeclRef to variable - check if it has a constant initializer
+  // DeclRef to variable - only treat as constant if it's truly immutable
   if (const auto *declRef = dyn_cast<DeclRefExpr>(expr)) {
+    // Handle enum constants
+    if (const auto *enumConst = dyn_cast<EnumConstantDecl>(declRef->getDecl())) {
+      return llvm::APSInt(enumConst->getInitVal());
+    }
+
     if (const auto *varDecl = dyn_cast<VarDecl>(declRef->getDecl())) {
-      // Check for local variable with constant initializer
-      if (varDecl->hasInit()) {
+      // Only consider constexpr or const-qualified variables with literal initializers
+      // as constants. Regular variables (even with constant initializers) can be
+      // modified at runtime, so we must NOT fold them.
+      bool isConstQualified = varDecl->getType().isConstQualified();
+      bool isConstexpr = varDecl->isConstexpr();
+
+      if ((isConstexpr || isConstQualified) && varDecl->hasInit()) {
         const Expr *init = varDecl->getInit();
 
         // Use Clang's constant evaluator
@@ -136,11 +146,11 @@ std::optional<llvm::APSInt> ConstantArgumentAnalyzer::evaluateConstant(
     }
   }
 
-  // Try Clang's general constant evaluator as fallback
-  Expr::EvalResult result;
-  if (expr->EvaluateAsInt(result, ctx)) {
-    return result.Val.getInt();
-  }
+  // NOTE: We intentionally do NOT use Clang's general EvaluateAsInt as fallback.
+  // That evaluator can incorrectly treat non-const variables with constant
+  // initializers as constants, even when those variables are modified at runtime.
+  // We only fold true compile-time constants: literals, enum values, constexpr,
+  // and const-qualified variables.
 
   return std::nullopt;
 }

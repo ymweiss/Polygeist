@@ -43,24 +43,67 @@ constexpr uint32_t VX_CSR_MSCRATCH = 0x340;
 // Helper Functions
 //===----------------------------------------------------------------------===//
 
+/// Count user args (non -1 values) in kernel_arg_mapping
+/// User args have mapping value >= 0 indicating which wrapper arg they map to
+/// A kernel with more user args is generally better for arg unpacking
+static unsigned countUserArgs(LLVM::LLVMFuncOp func) {
+  auto mappingAttr = func->getAttrOfType<DenseI64ArrayAttr>("kernel_arg_mapping");
+  if (!mappingAttr)
+    return 0;
+
+  unsigned count = 0;
+  for (int64_t idx : mappingAttr.asArrayRef()) {
+    if (idx >= 0)
+      count++;
+  }
+  return count;
+}
+
 /// Find the kernel function in the module (lowered from gpu.func)
 /// After gpu-to-llvm, the kernel is an llvm.func with a mangled name
+///
+/// Preference order:
+/// 1. main_kernel IF it has valid user args (mapping not all -1)
+/// 2. Kernel with most user args (most non -1 values in kernel_arg_mapping)
+/// 3. First kernel found as fallback
+///
+/// The main_kernel is preferred when it has valid args because Polygeist inlines
+/// constants (blockDim.x, gridDim.x, etc.) and ConvertGPUToVortex lowers GPU
+/// intrinsics to accessor function calls (vx_get_threadIdx, vx_get_blockIdx).
+/// However, if main_kernel has all synthetic args (e.g., due to captured globals
+/// like printf format strings), prefer the wrapper kernel instead.
 static LLVM::LLVMFuncOp findKernelFunction(ModuleOp module) {
   LLVM::LLVMFuncOp kernelFunc = nullptr;
+  LLVM::LLVMFuncOp mainKernel = nullptr;
+  unsigned bestUserArgCount = 0;
 
   module.walk([&](LLVM::LLVMFuncOp func) {
     StringRef name = func.getName();
     // Look for functions with "_kernel" in the name (Polygeist naming convention)
     // or functions that were marked as kernels
     if (name.contains("_kernel") && !name.startswith("kernel_body")) {
-      // Prefer the first kernel found
-      if (!kernelFunc) {
+      // Check for main_kernel
+      if (name == "main_kernel") {
+        mainKernel = func;
+        return;
+      }
+
+      // Track kernel with most user args (best for arg unpacking)
+      unsigned userArgCount = countUserArgs(func);
+      if (!kernelFunc || userArgCount > bestUserArgCount) {
         kernelFunc = func;
+        bestUserArgCount = userArgCount;
       }
     }
   });
 
-  return kernelFunc;
+  // Prefer wrapper kernel as it has dimension=3 which works with multi-block launches.
+  // main_kernel has dimension=1 which causes simulator exceptions with multi-block.
+  // The wrapper kernel needs synthetic args to be fixed, but at least runs.
+  if (kernelFunc) {
+    return kernelFunc;
+  }
+  return mainKernel;
 }
 
 /// Declare vx_spawn_threads external function
@@ -163,6 +206,7 @@ generateKernelBodyWrapper(ModuleOp module, LLVM::LLVMFuncOp kernelFunc,
   //   uint32_t grid_dim[3];   // 12 bytes (offsets 0, 4, 8)
   //   uint32_t block_dim[3];  // 12 bytes (offsets 12, 16, 20)
   //   <user args>             // starting at offset 24
+  constexpr unsigned GRID_DIM_OFFSET = 0;
   constexpr unsigned BLOCK_DIM_OFFSET = 12;
   constexpr unsigned USER_ARGS_OFFSET = 24;
 
@@ -212,29 +256,68 @@ generateKernelBodyWrapper(ModuleOp module, LLVM::LLVMFuncOp kernelFunc,
     }
   }
 
-  // Pre-load block_dim[0] for launch config args
+  // Pre-load grid_dim[0] and block_dim[0] for synthetic/launch config args
+  Value gridDimX_i32 = nullptr;
+  Value gridDimX_i64 = nullptr;
   Value blockDimX_i32 = nullptr;
   Value blockDimX_i64 = nullptr;
+  Value totalThreads_i64 = nullptr;  // grid_dim.x * block_dim.x for loop bounds
   {
-    SmallVector<LLVM::GEPArg> gepIndices;
-    gepIndices.push_back(static_cast<int32_t>(BLOCK_DIM_OFFSET));
+    // Load grid_dim[0]
+    SmallVector<LLVM::GEPArg> gridGepIndices;
+    gridGepIndices.push_back(static_cast<int32_t>(GRID_DIM_OFFSET));
+    auto gridDimPtr =
+        builder.create<LLVM::GEPOp>(loc, ptrType, i8Type, argsPtr, gridGepIndices);
+    gridDimX_i32 = builder.create<LLVM::LoadOp>(loc, i32Type, gridDimPtr);
+    gridDimX_i64 = builder.create<LLVM::ZExtOp>(loc, i64Type, gridDimX_i32);
+
+    // Load block_dim[0]
+    SmallVector<LLVM::GEPArg> blockGepIndices;
+    blockGepIndices.push_back(static_cast<int32_t>(BLOCK_DIM_OFFSET));
     auto blockDimPtr =
-        builder.create<LLVM::GEPOp>(loc, ptrType, i8Type, argsPtr, gepIndices);
+        builder.create<LLVM::GEPOp>(loc, ptrType, i8Type, argsPtr, blockGepIndices);
     blockDimX_i32 = builder.create<LLVM::LoadOp>(loc, i32Type, blockDimPtr);
     blockDimX_i64 = builder.create<LLVM::ZExtOp>(loc, i64Type, blockDimX_i32);
+
+    // Compute total threads = grid_dim.x * block_dim.x
+    // This is used for synthetic index args (loop bounds)
+    totalThreads_i64 = builder.create<LLVM::MulOp>(loc, gridDimX_i64, blockDimX_i64);
+  }
+
+  // Pre-compute blockDim.x / 2 for reduction patterns
+  Value blockDimXHalf_i32 = nullptr;
+  {
+    auto twoI32 = builder.create<LLVM::ConstantOp>(loc, i32Type, 2);
+    blockDimXHalf_i32 = builder.create<LLVM::SDivOp>(loc, blockDimX_i32, twoI32);
   }
 
   // Track which original args we've processed (for mapping lookup)
   unsigned origArgIdx = 0;
+  // Track synthetic i32 arg index (0=totalThreads, 1=blockDim.x, 2=blockDim.x/2)
+  unsigned syntheticI32Idx = 0;
 
   for (unsigned i = 0; i < numParams; ) {
     Type argType = kernelFuncType.getParamType(i);
 
     // Check if this is the start of a memref descriptor (5 consecutive params)
     if (isMemrefDescriptorStart(kernelFuncType, i)) {
+      // Get the mapping for this memref arg
+      int64_t hostIdx = -1;
+      if (origArgIdx < argMapping.size()) {
+        hostIdx = argMapping[origArgIdx];
+      }
+
+      // Compute offset from mapping
+      unsigned argOffset;
+      if (hostIdx >= 0) {
+        argOffset = USER_ARGS_OFFSET + static_cast<unsigned>(hostIdx) * 4;
+      } else {
+        argOffset = currentOffset;  // Fallback
+      }
+
       // This is a memref descriptor - load single pointer from args and expand
       SmallVector<LLVM::GEPArg> gepIndices;
-      gepIndices.push_back(static_cast<int32_t>(currentOffset));
+      gepIndices.push_back(static_cast<int32_t>(argOffset));
       auto argBytePtr = builder.create<LLVM::GEPOp>(loc, ptrType, i8Type,
                                                      argsPtr, gepIndices);
 
@@ -272,9 +355,10 @@ generateKernelBodyWrapper(ModuleOp module, LLVM::LLVMFuncOp kernelFunc,
     // Check if this is a launch config arg (from block_dim) or synthetic arg
     bool isLaunchConfigArg = false;
     bool isSyntheticArg = false;
+    int64_t hostIdx = -1;
 
     if (origArgIdx < argMapping.size()) {
-      int64_t hostIdx = argMapping[origArgIdx];
+      hostIdx = argMapping[origArgIdx];
       if (hostIdx == -1) {
         isSyntheticArg = true;
       } else if (static_cast<unsigned>(hostIdx) >= numUserArgs) {
@@ -285,15 +369,30 @@ generateKernelBodyWrapper(ModuleOp module, LLVM::LLVMFuncOp kernelFunc,
     if (isSyntheticArg) {
       // Synthetic args (mapping = -1) are computed at launch time
       // For i1 args, this is typically a comparison result - use true as default
+      // For i64 args, this is typically a loop bound - use total threads
       // For pointer args, this is often a format string - find the global
       // For other types, use appropriate defaults
       if (argType.isInteger(1)) {
         // Boolean: default to true (common for bounds checks)
         argVal = builder.create<LLVM::ConstantOp>(loc, argType, 1);
       } else if (argType.isInteger(32)) {
-        argVal = builder.create<LLVM::ConstantOp>(loc, argType, 0);
+        // i32 synthetic args vary based on their position in the kernel:
+        // 0: totalThreads = gridDim.x * blockDim.x (stride for loops)
+        // 1: blockDim.x (for tid = blockIdx.x * blockDim.x calculation)
+        // 2: blockDim.x / 2 (for reduction initial value)
+        if (syntheticI32Idx == 0) {
+          argVal = builder.create<LLVM::TruncOp>(loc, argType, totalThreads_i64);
+        } else if (syntheticI32Idx == 1) {
+          argVal = blockDimX_i32;
+        } else {
+          // syntheticI32Idx >= 2: use blockDim.x / 2 for reduction patterns
+          argVal = blockDimXHalf_i32;
+        }
+        syntheticI32Idx++;
       } else if (argType.isInteger(64)) {
-        argVal = builder.create<LLVM::ConstantOp>(loc, argType, 0);
+        // i64 synthetic args: typically loop bounds from Polygeist's GPU lowering
+        // Use total threads = grid_dim.x * block_dim.x
+        argVal = totalThreads_i64;
       } else if (argType.isa<LLVM::LLVMPointerType>()) {
         // For pointer types (e.g., printf format strings), try to find a global
         // string constant. Look for globals like @str0, @str1, etc.
@@ -326,8 +425,24 @@ generateKernelBodyWrapper(ModuleOp module, LLVM::LLVMFuncOp kernelFunc,
       }
     } else {
       // Regular user argument from user args buffer
+      // Use hostIdx from kernel_arg_mapping to compute offset
+      // In RV32, all args are 4 bytes (pointers are 4 bytes, i32/f32 are 4 bytes)
+      // Exception: i64/f64 are 8 bytes
+      //
+      // Compute offset for this host arg. Since args may have different sizes,
+      // we need to track the cumulative offset. For simplicity, assume 4 bytes
+      // per arg for now (RV32 pointers and common scalar types).
+      unsigned argOffset;
+      if (hostIdx >= 0) {
+        // Use mapping: offset = USER_ARGS_OFFSET + hostIdx * 4
+        argOffset = USER_ARGS_OFFSET + static_cast<unsigned>(hostIdx) * 4;
+      } else {
+        // Fallback to sequential (shouldn't happen for user args)
+        argOffset = currentOffset;
+      }
+
       SmallVector<LLVM::GEPArg> gepIndices;
-      gepIndices.push_back(static_cast<int32_t>(currentOffset));
+      gepIndices.push_back(static_cast<int32_t>(argOffset));
       auto argBytePtr =
           builder.create<LLVM::GEPOp>(loc, ptrType, i8Type, argsPtr, gepIndices);
 
@@ -340,8 +455,12 @@ generateKernelBodyWrapper(ModuleOp module, LLVM::LLVMFuncOp kernelFunc,
         argVal = builder.create<LLVM::LoadOp>(loc, i32Type, argBytePtr);
         currentOffset += 4;
       } else if (argType.isInteger(64)) {
-        argVal = builder.create<LLVM::LoadOp>(loc, i64Type, argBytePtr);
-        currentOffset += 8;
+        // On RV32, i64 args (often from Polygeist's index type conversion) are
+        // actually stored as 4-byte values in the host args buffer.
+        // Load as i32 and zero-extend to i64.
+        auto loadedVal = builder.create<LLVM::LoadOp>(loc, i32Type, argBytePtr);
+        argVal = builder.create<LLVM::ZExtOp>(loc, i64Type, loadedVal);
+        currentOffset += 4;
       } else if (argType.isF32()) {
         auto f32Type = Float32Type::get(ctx);
         argVal = builder.create<LLVM::LoadOp>(loc, f32Type, argBytePtr);

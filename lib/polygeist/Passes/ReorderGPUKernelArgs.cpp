@@ -71,32 +71,48 @@ static StringRef extractBaseKernelName(StringRef fullName) {
   return fullName;
 }
 
-/// Compute the permutation from device (Polygeist-reordered) to original order.
+/// Compute the permutation from device (GPU kernel) order to original (wrapper) order.
 /// Returns deviceToOriginal[device_idx] = original_idx
+///
+/// This matches GPU args to wrapper args by TYPE:
+/// - Each GPU scalar is matched to the next available wrapper scalar
+/// - Each GPU pointer is matched to the next available wrapper pointer
 static std::vector<unsigned> computeArgPermutation(
-    const std::vector<bool> &originalIsPointer) {
+    const std::vector<bool> &originalIsPointer,
+    const SmallVector<bool> &deviceIsPointer) {
 
   unsigned numUserArgs = originalIsPointer.size();
   std::vector<unsigned> deviceToOriginal(numUserArgs);
 
-  // Polygeist puts scalars first, then pointers, preserving relative order
-  unsigned numOriginalScalars = 0;
-  for (bool isPtr : originalIsPointer) {
-    if (!isPtr) numOriginalScalars++;
-  }
-
-  // Map scalars: they're at the front in device order
-  unsigned currentScalarIdx = 0;
-  for (unsigned origIdx = 0; origIdx < numUserArgs; ++origIdx) {
-    if (!originalIsPointer[origIdx]) {
-      deviceToOriginal[currentScalarIdx++] = origIdx;
+  // Build lists of wrapper scalar and pointer indices
+  SmallVector<unsigned> wrapperScalarIndices;
+  SmallVector<unsigned> wrapperPointerIndices;
+  for (unsigned i = 0; i < numUserArgs; ++i) {
+    if (originalIsPointer[i]) {
+      wrapperPointerIndices.push_back(i);
+    } else {
+      wrapperScalarIndices.push_back(i);
     }
   }
-  // Map pointers: they're after scalars in device order
-  unsigned currentPtrIdx = 0;
-  for (unsigned origIdx = 0; origIdx < numUserArgs; ++origIdx) {
-    if (originalIsPointer[origIdx]) {
-      deviceToOriginal[numOriginalScalars + currentPtrIdx++] = origIdx;
+
+  // Match each device arg to the next wrapper arg of the same type
+  unsigned scalarsSeen = 0;
+  unsigned pointersSeen = 0;
+  for (unsigned devIdx = 0; devIdx < numUserArgs; ++devIdx) {
+    if (deviceIsPointer[devIdx]) {
+      // Device arg is pointer - match to next wrapper pointer
+      if (pointersSeen < wrapperPointerIndices.size()) {
+        deviceToOriginal[devIdx] = wrapperPointerIndices[pointersSeen++];
+      } else {
+        deviceToOriginal[devIdx] = devIdx;  // Fallback
+      }
+    } else {
+      // Device arg is scalar - match to next wrapper scalar
+      if (scalarsSeen < wrapperScalarIndices.size()) {
+        deviceToOriginal[devIdx] = wrapperScalarIndices[scalarsSeen++];
+      } else {
+        deviceToOriginal[devIdx] = devIdx;  // Fallback
+      }
     }
   }
 
@@ -170,9 +186,16 @@ static bool reorderGPUKernelArguments(
   if (!needsReorder)
     return false;
 
+  // Build deviceIsPointer array from GPU arg types (user args only)
+  SmallVector<bool> deviceIsPointer;
+  for (unsigned i = 0; i < numUserArgs; ++i) {
+    Type gpuArgType = argTypes[argsToSkip + i];
+    deviceIsPointer.push_back(gpuArgType.isa<MemRefType>());
+  }
+
   // Compute permutation: deviceToOriginal[device_idx] = original_idx
   // This is only used if we actually need to reorder.
-  auto deviceToOriginal = computeArgPermutation(originalIsPointer);
+  auto deviceToOriginal = computeArgPermutation(originalIsPointer, deviceIsPointer);
 
   // Compute inverse: originalToDevice[original_idx] = device_idx
   std::vector<unsigned> originalToDevice(numUserArgs);

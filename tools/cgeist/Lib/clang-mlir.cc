@@ -433,10 +433,20 @@ void MLIRScanner::init(mlir::func::FuncOp function, const FunctionDecl *fd) {
   auto i1Ty = builder.getIntegerType(1);
   auto type = mlir::MemRefType::get({}, i1Ty, {}, 0);
   auto truev = builder.create<ConstantIntOp>(loc, true, 1);
-  loops.push_back({builder.create<mlir::memref::AllocaOp>(loc, type),
-                   builder.create<mlir::memref::AllocaOp>(loc, type)});
-  builder.create<mlir::memref::StoreOp>(loc, truev, loops.back().noBreak);
-  builder.create<mlir::memref::StoreOp>(loc, truev, loops.back().keepRunning);
+
+  // Skip loop context for kernel launch wrapper functions.
+  // These simple functions only contain a kernel call and don't need
+  // break/continue/return handling. Creating loop context causes IfScope
+  // to wrap statements in scf.execute_region, which gets optimized away
+  // and loses the gpu.launch operation inside.
+  bool isLaunchWrapper = function.getName().starts_with("_Z") &&
+                         function.getName().contains("__launch_");
+  if (!isLaunchWrapper) {
+    loops.push_back({builder.create<mlir::memref::AllocaOp>(loc, type),
+                     builder.create<mlir::memref::AllocaOp>(loc, type)});
+    builder.create<mlir::memref::StoreOp>(loc, truev, loops.back().noBreak);
+    builder.create<mlir::memref::StoreOp>(loc, truev, loops.back().keepRunning);
+  }
   if (function.getFunctionType().getResults().size()) {
     auto type = mlir::MemRefType::get(
         {}, function.getFunctionType().getResult(0), {}, 0);
