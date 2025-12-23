@@ -376,17 +376,42 @@ generateKernelBodyWrapper(ModuleOp module, LLVM::LLVMFuncOp kernelFunc,
         // Boolean: default to true (common for bounds checks)
         argVal = builder.create<LLVM::ConstantOp>(loc, argType, 1);
       } else if (argType.isInteger(32)) {
-        // i32 synthetic args vary based on their position in the kernel:
-        // 0: totalThreads = gridDim.x * blockDim.x (stride for loops)
-        // 1: blockDim.x (for tid = blockIdx.x * blockDim.x calculation)
-        // 2: blockDim.x / 2 (for reduction initial value)
-        if (syntheticI32Idx == 0) {
-          argVal = builder.create<LLVM::TruncOp>(loc, argType, totalThreads_i64);
-        } else if (syntheticI32Idx == 1) {
-          argVal = blockDimX_i32;
-        } else {
-          // syntheticI32Idx >= 2: use blockDim.x / 2 for reduction patterns
-          argVal = blockDimXHalf_i32;
+        // Check for semantic annotation first (robust approach)
+        bool usedSemantic = false;
+        if (auto semanticAttr = kernelFunc.getArgAttr(i, "vortex.synthetic_semantic")) {
+          if (auto strAttr = dyn_cast<StringAttr>(semanticAttr)) {
+            StringRef semantic = strAttr.getValue();
+            if (semantic == "totalThreads") {
+              argVal = builder.create<LLVM::TruncOp>(loc, argType, totalThreads_i64);
+              usedSemantic = true;
+            } else if (semantic == "blockDim.x") {
+              argVal = blockDimX_i32;
+              usedSemantic = true;
+            } else if (semantic == "blockDim/2") {
+              argVal = blockDimXHalf_i32;
+              usedSemantic = true;
+            } else if (semantic == "gridDim.x") {
+              argVal = gridDimX_i32;
+              usedSemantic = true;
+            }
+            // Add more semantic values as needed
+          }
+        }
+
+        // Fallback to positional heuristics if no semantic annotation
+        if (!usedSemantic) {
+          // i32 synthetic args vary based on their position in the kernel:
+          // 0: totalThreads = gridDim.x * blockDim.x (stride for loops)
+          // 1: blockDim.x (for tid = blockIdx.x * blockDim.x calculation)
+          // 2: blockDim.x / 2 (for reduction initial value)
+          if (syntheticI32Idx == 0) {
+            argVal = builder.create<LLVM::TruncOp>(loc, argType, totalThreads_i64);
+          } else if (syntheticI32Idx == 1) {
+            argVal = blockDimX_i32;
+          } else {
+            // syntheticI32Idx >= 2: use blockDim.x / 2 for reduction patterns
+            argVal = blockDimXHalf_i32;
+          }
         }
         syntheticI32Idx++;
       } else if (argType.isInteger(64)) {

@@ -1403,6 +1403,14 @@ struct ConvertGPUToVortexPass
           funcOp->setAttr("vortex.kernel_dimension", dimAttr);
         }
 
+        // Preserve argument attributes like vortex.synthetic_semantic
+        // These tell GenerateVortexMain what value each synthetic arg represents
+        for (unsigned i = 0; i < gpuFunc.getNumArguments(); ++i) {
+          if (auto semanticAttr = gpuFunc.getArgAttr(i, "vortex.synthetic_semantic")) {
+            funcOp.setArgAttr(i, "vortex.synthetic_semantic", semanticAttr);
+          }
+        }
+
         // Clone the function body
         IRMapping mapping;
         gpuFunc.getBody().cloneInto(&funcOp.getBody(), mapping);
