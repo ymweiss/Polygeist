@@ -284,6 +284,19 @@ generateKernelBodyWrapper(ModuleOp module, LLVM::LLVMFuncOp kernelFunc,
     totalThreads_i64 = builder.create<LLVM::MulOp>(loc, gridDimX_i64, blockDimX_i64);
   }
 
+  // Load blockDim.y for 2D block calculations
+  Value blockDimY_i32 = nullptr;
+  {
+    SmallVector<LLVM::GEPArg> gepIndices;
+    gepIndices.push_back(static_cast<int32_t>(BLOCK_DIM_OFFSET + 4)); // blockDim.y is 4 bytes after blockDim.x
+    auto blockDimYPtr =
+        builder.create<LLVM::GEPOp>(loc, ptrType, i8Type, argsPtr, gepIndices);
+    blockDimY_i32 = builder.create<LLVM::LoadOp>(loc, i32Type, blockDimYPtr);
+  }
+
+  // Compute blockDim.x * blockDim.y for 2D shared memory offsets
+  Value blockDimXY_i32 = builder.create<LLVM::MulOp>(loc, blockDimX_i32, blockDimY_i32);
+
   // Pre-compute blockDim.x / 2 for reduction patterns
   Value blockDimXHalf_i32 = nullptr;
   {
@@ -387,6 +400,12 @@ generateKernelBodyWrapper(ModuleOp module, LLVM::LLVMFuncOp kernelFunc,
             } else if (semantic == "blockDim.x") {
               argVal = blockDimX_i32;
               usedSemantic = true;
+            } else if (semantic == "blockDim.y") {
+              argVal = blockDimY_i32;
+              usedSemantic = true;
+            } else if (semantic == "blockDimXY") {
+              argVal = blockDimXY_i32;
+              usedSemantic = true;
             } else if (semantic == "blockDim/2") {
               argVal = blockDimXHalf_i32;
               usedSemantic = true;
@@ -394,7 +413,7 @@ generateKernelBodyWrapper(ModuleOp module, LLVM::LLVMFuncOp kernelFunc,
               argVal = gridDimX_i32;
               usedSemantic = true;
             }
-            // Add more semantic values as needed
+            // More semantics: blockDim.z, gridDim.y, gridDim.z, etc. can be added as needed
           }
         }
 
