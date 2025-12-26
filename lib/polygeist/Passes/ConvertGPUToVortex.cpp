@@ -18,6 +18,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
@@ -375,6 +376,77 @@ struct BarrierOpLowering : public ConvertOpToLLVMPattern<gpu::BarrierOp> {
 
     // Declare vx_barrier_abi function in gpu.module if not already declared
     // Using _abi suffix to call the non-inline wrapper in vx_intrinsics_abi.c
+    auto vxBarrierFunc = gpuModule.lookupSymbol<LLVM::LLVMFuncOp>("vx_barrier_abi");
+    if (!vxBarrierFunc) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(gpuModule.getBody());
+
+      auto funcType = LLVM::LLVMFunctionType::get(
+          LLVM::LLVMVoidType::get(context),
+          {i32Type, i32Type},
+          /*isVarArg=*/false);
+
+      vxBarrierFunc = rewriter.create<LLVM::LLVMFuncOp>(
+          gpuModule.getLoc(), "vx_barrier_abi", funcType);
+    }
+
+    // Call vx_barrier_abi(barrier_id, num_warps)
+    SmallVector<Value> args;
+    args.push_back(barIdConstant.getResult());
+    args.push_back(numWarps.getResult());
+
+    rewriter.replaceOpWithNewOp<LLVM::CallOp>(
+        op, vxBarrierFunc, args);
+
+    return success();
+  }
+};
+
+/// Lower nvvm.barrier0 to Vortex vx_barrier call
+/// Synchronizes all threads in a block using Vortex hardware barriers
+/// This handles the case where __syncthreads() is lowered to nvvm.barrier0
+/// instead of gpu.barrier
+struct NVVMBarrier0OpLowering : public ConvertOpToLLVMPattern<NVVM::Barrier0Op> {
+  using ConvertOpToLLVMPattern<NVVM::Barrier0Op>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(NVVM::Barrier0Op op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    // Declare functions in gpu.module (not top-level module) so they're visible
+    auto gpuModule = op->getParentOfType<gpu::GPUModuleOp>();
+    if (!gpuModule)
+      return failure();
+    MLIRContext *context = gpuModule.getContext();
+
+    // Allocate barrier ID (simple counter for now)
+    // TODO: Proper barrier ID allocation to avoid conflicts
+    static int barrierIdCounter = 0;
+    int barrierId = barrierIdCounter++;
+
+    // Create barrier ID constant
+    auto i32Type = rewriter.getI32Type();
+    auto barIdConstant = rewriter.create<LLVM::ConstantOp>(
+        loc, i32Type, rewriter.getI32IntegerAttr(barrierId));
+
+    // Declare vx_num_warps_abi function in gpu.module if not already declared
+    auto vxNumWarpsFunc = gpuModule.lookupSymbol<LLVM::LLVMFuncOp>("vx_num_warps_abi");
+    if (!vxNumWarpsFunc) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(gpuModule.getBody());
+
+      auto funcType = LLVM::LLVMFunctionType::get(
+          i32Type, {}, /*isVarArg=*/false);
+
+      vxNumWarpsFunc = rewriter.create<LLVM::LLVMFuncOp>(
+          gpuModule.getLoc(), "vx_num_warps_abi", funcType);
+    }
+
+    // Call vx_num_warps_abi() to get number of warps
+    auto numWarps = rewriter.create<LLVM::CallOp>(
+        loc, vxNumWarpsFunc, ValueRange{});
+
+    // Declare vx_barrier_abi function in gpu.module if not already declared
     auto vxBarrierFunc = gpuModule.lookupSymbol<LLVM::LLVMFuncOp>("vx_barrier_abi");
     if (!vxBarrierFunc) {
       OpBuilder::InsertionGuard guard(rewriter);
@@ -1266,12 +1338,12 @@ struct ConvertGPUToVortexPass
     ConversionTarget target(*context);
     target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
     target.addIllegalOp<ThreadIdOp, BlockIdOp, gpu::BlockDimOp, gpu::GridDimOp,
-                        gpu::BarrierOp>();
+                        gpu::BarrierOp, NVVM::Barrier0Op>();
 
     // Set up rewrite patterns
     RewritePatternSet patterns(context);
     patterns.add<ThreadIdOpLowering, BlockIdOpLowering, BlockDimOpLowering,
-                 GridDimOpLowering, BarrierOpLowering>(typeConverter);
+                 GridDimOpLowering, BarrierOpLowering, NVVMBarrier0OpLowering>(typeConverter);
 
     // Apply the conversion
     if (failed(applyPartialConversion(module, target, std::move(patterns)))) {
@@ -1310,6 +1382,10 @@ struct ConvertGPUToVortexPass
     // Extract kernel dimension from gpu.launch_func and set as attribute on kernel
     // This determines whether vx_spawn_threads uses 1D, 2D, or 3D dispatch
     // Dimension is determined by checking if gridSizeY/Z are constant 1
+    //
+    // IMPORTANT: Only process launch_func ops inside main() or similar host entry points.
+    // Launch wrapper functions (like __launch_*_kernel) have dynamic grid sizes
+    // which would incorrectly set dimension=3 for 2D kernels.
     module.walk([&](gpu::LaunchFuncOp launchOp) {
       // Find the corresponding gpu.func
       auto kernelSymbol = launchOp.getKernel();
@@ -1319,14 +1395,13 @@ struct ConvertGPUToVortexPass
         return;
       auto gpuFunc = gpuModule.lookupSymbol<gpu::GPUFuncOp>(
           kernelSymbol.getLeafReference());
-      if (!gpuFunc || gpuFunc->hasAttr("vortex.kernel_dimension"))
-        return;  // Already processed or not found
+      if (!gpuFunc)
+        return;  // Not found
 
-      // Determine dimension from grid sizes
-      // 1D: gridSizeY == 1 && gridSizeZ == 1
-      // 2D: gridSizeZ == 1
-      // 3D: otherwise
-      unsigned dimension = 3;  // Default to 3D
+      // Skip launch_func ops in wrapper functions (those with dynamic grid sizes)
+      // Only process if the parent function is main() or has constant grid sizes
+      auto parentFunc = launchOp->getParentOfType<func::FuncOp>();
+      bool isInMain = parentFunc && parentFunc.getName() == "main";
 
       auto isConstantOne = [](Value v) -> bool {
         if (auto constOp = v.getDefiningOp<arith::ConstantOp>()) {
@@ -1339,6 +1414,23 @@ struct ConvertGPUToVortexPass
 
       bool gridYIsOne = isConstantOne(launchOp.getGridSizeY());
       bool gridZIsOne = isConstantOne(launchOp.getGridSizeZ());
+      bool hasConstantGridSizes = gridYIsOne || gridZIsOne;
+
+      // Skip if not in main and doesn't have determinable grid sizes
+      // This avoids wrapper functions with dynamic grid sizes overriding correct values
+      if (!isInMain && !hasConstantGridSizes)
+        return;
+
+      // If already has dimension attribute and this is not in main, skip
+      // (prefer main's launch_func for dimension determination)
+      if (gpuFunc->hasAttr("vortex.kernel_dimension") && !isInMain)
+        return;
+
+      // Determine dimension from grid sizes
+      // 1D: gridSizeY == 1 && gridSizeZ == 1
+      // 2D: gridSizeZ == 1
+      // 3D: otherwise
+      unsigned dimension = 3;  // Default to 3D
 
       if (gridYIsOne && gridZIsOne) {
         dimension = 1;
