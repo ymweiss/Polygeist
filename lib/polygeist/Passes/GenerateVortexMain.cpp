@@ -219,6 +219,13 @@ generateKernelBodyWrapper(ModuleOp module, LLVM::LLVMFuncOp kernelFunc,
   //   uint32_t grid_dim[3];   // 12 bytes (offsets 0, 4, 8)
   //   uint32_t block_dim[3];  // 12 bytes (offsets 12, 16, 20)
   //   <user args>             // starting at offset 24
+  //
+  // IMPORTANT: Polygeist transforms kernel args during GPU lowering. The first
+  // two kernel args are typically derived from block_dim.x (threads_per_block):
+  //   arg0 = block_dim.x as i64 (index type)
+  //   arg1 = block_dim.x as i32
+  // These should be loaded from block_dim[0] in the header, not from user args.
+  // The remaining args (arg2+) come from the user args buffer.
   constexpr unsigned BLOCK_DIM_OFFSET = 12;
   constexpr unsigned USER_ARGS_OFFSET = 24;
 
