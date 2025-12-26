@@ -206,7 +206,6 @@ generateKernelBodyWrapper(ModuleOp module, LLVM::LLVMFuncOp kernelFunc,
   //   uint32_t grid_dim[3];   // 12 bytes (offsets 0, 4, 8)
   //   uint32_t block_dim[3];  // 12 bytes (offsets 12, 16, 20)
   //   <user args>             // starting at offset 24
-  constexpr unsigned GRID_DIM_OFFSET = 0;
   constexpr unsigned BLOCK_DIM_OFFSET = 12;
   constexpr unsigned USER_ARGS_OFFSET = 24;
 
@@ -256,58 +255,22 @@ generateKernelBodyWrapper(ModuleOp module, LLVM::LLVMFuncOp kernelFunc,
     }
   }
 
-  // Pre-load grid_dim[0] and block_dim[0] for synthetic/launch config args
-  Value gridDimX_i32 = nullptr;
-  Value gridDimX_i64 = nullptr;
+  // Pre-load block_dim[0] for launch config args (user args that came from blockDim.x)
+  // Note: After constant sinking, synthetic args should be rare. This is only for
+  // kernel args that explicitly reference blockDim.x in the kernel signature.
   Value blockDimX_i32 = nullptr;
   Value blockDimX_i64 = nullptr;
-  Value totalThreads_i64 = nullptr;  // grid_dim.x * block_dim.x for loop bounds
   {
-    // Load grid_dim[0]
-    SmallVector<LLVM::GEPArg> gridGepIndices;
-    gridGepIndices.push_back(static_cast<int32_t>(GRID_DIM_OFFSET));
-    auto gridDimPtr =
-        builder.create<LLVM::GEPOp>(loc, ptrType, i8Type, argsPtr, gridGepIndices);
-    gridDimX_i32 = builder.create<LLVM::LoadOp>(loc, i32Type, gridDimPtr);
-    gridDimX_i64 = builder.create<LLVM::ZExtOp>(loc, i64Type, gridDimX_i32);
-
-    // Load block_dim[0]
     SmallVector<LLVM::GEPArg> blockGepIndices;
     blockGepIndices.push_back(static_cast<int32_t>(BLOCK_DIM_OFFSET));
     auto blockDimPtr =
         builder.create<LLVM::GEPOp>(loc, ptrType, i8Type, argsPtr, blockGepIndices);
     blockDimX_i32 = builder.create<LLVM::LoadOp>(loc, i32Type, blockDimPtr);
     blockDimX_i64 = builder.create<LLVM::ZExtOp>(loc, i64Type, blockDimX_i32);
-
-    // Compute total threads = grid_dim.x * block_dim.x
-    // This is used for synthetic index args (loop bounds)
-    totalThreads_i64 = builder.create<LLVM::MulOp>(loc, gridDimX_i64, blockDimX_i64);
-  }
-
-  // Load blockDim.y for 2D block calculations
-  Value blockDimY_i32 = nullptr;
-  {
-    SmallVector<LLVM::GEPArg> gepIndices;
-    gepIndices.push_back(static_cast<int32_t>(BLOCK_DIM_OFFSET + 4)); // blockDim.y is 4 bytes after blockDim.x
-    auto blockDimYPtr =
-        builder.create<LLVM::GEPOp>(loc, ptrType, i8Type, argsPtr, gepIndices);
-    blockDimY_i32 = builder.create<LLVM::LoadOp>(loc, i32Type, blockDimYPtr);
-  }
-
-  // Compute blockDim.x * blockDim.y for 2D shared memory offsets
-  Value blockDimXY_i32 = builder.create<LLVM::MulOp>(loc, blockDimX_i32, blockDimY_i32);
-
-  // Pre-compute blockDim.x / 2 for reduction patterns
-  Value blockDimXHalf_i32 = nullptr;
-  {
-    auto twoI32 = builder.create<LLVM::ConstantOp>(loc, i32Type, 2);
-    blockDimXHalf_i32 = builder.create<LLVM::SDivOp>(loc, blockDimX_i32, twoI32);
   }
 
   // Track which original args we've processed (for mapping lookup)
   unsigned origArgIdx = 0;
-  // Track synthetic i32 arg index (0=totalThreads, 1=blockDim.x, 2=blockDim.x/2)
-  unsigned syntheticI32Idx = 0;
 
   for (unsigned i = 0; i < numParams; ) {
     Type argType = kernelFuncType.getParamType(i);
@@ -380,84 +343,32 @@ generateKernelBodyWrapper(ModuleOp module, LLVM::LLVMFuncOp kernelFunc,
     }
 
     if (isSyntheticArg) {
-      // Synthetic args (mapping = -1) are computed at launch time
-      // For i1 args, this is typically a comparison result - use true as default
-      // For i64 args, this is typically a loop bound - use total threads
-      // For pointer args, this is often a format string - find the global
-      // For other types, use appropriate defaults
+      // Synthetic args (mapping = -1) should be rare after constant sinking.
+      // The createGpuLauchSinkIndexComputationsPass embeds constants (loop bounds,
+      // initial values) directly into the kernel body before outlining.
+      //
+      // If we still have synthetic args, emit a warning and use simple defaults.
+      // Complex heuristics were removed - fix at source level instead.
+      llvm::errs() << "Warning: Synthetic arg at kernel param index " << i
+                   << " (type: ";
+      argType.print(llvm::errs());
+      llvm::errs() << "). Constants should be sunk at source level.\n";
+
       if (argType.isInteger(1)) {
-        // Boolean: default to true (common for bounds checks)
         argVal = builder.create<LLVM::ConstantOp>(loc, argType, 1);
       } else if (argType.isInteger(32)) {
-        // Check for semantic annotation first (robust approach)
-        bool usedSemantic = false;
-        if (auto semanticAttr = kernelFunc.getArgAttr(i, "vortex.synthetic_semantic")) {
-          if (auto strAttr = dyn_cast<StringAttr>(semanticAttr)) {
-            StringRef semantic = strAttr.getValue();
-            if (semantic == "totalThreads") {
-              argVal = builder.create<LLVM::TruncOp>(loc, argType, totalThreads_i64);
-              usedSemantic = true;
-            } else if (semantic == "blockDim.x") {
-              argVal = blockDimX_i32;
-              usedSemantic = true;
-            } else if (semantic == "blockDim.y") {
-              argVal = blockDimY_i32;
-              usedSemantic = true;
-            } else if (semantic == "blockDimXY") {
-              argVal = blockDimXY_i32;
-              usedSemantic = true;
-            } else if (semantic == "blockDim/2") {
-              argVal = blockDimXHalf_i32;
-              usedSemantic = true;
-            } else if (semantic == "gridDim.x") {
-              argVal = gridDimX_i32;
-              usedSemantic = true;
-            }
-            // More semantics: blockDim.z, gridDim.y, gridDim.z, etc. can be added as needed
-          }
-        }
-
-        // Fallback to positional heuristics if no semantic annotation
-        if (!usedSemantic) {
-          // i32 synthetic args vary based on their position in the kernel:
-          // 0: totalThreads = gridDim.x * blockDim.x (stride for loops)
-          // 1: blockDim.x (for tid = blockIdx.x * blockDim.x calculation)
-          // 2: blockDim.x / 2 (for reduction initial value)
-          if (syntheticI32Idx == 0) {
-            argVal = builder.create<LLVM::TruncOp>(loc, argType, totalThreads_i64);
-          } else if (syntheticI32Idx == 1) {
-            argVal = blockDimX_i32;
-          } else {
-            // syntheticI32Idx >= 2: use blockDim.x / 2 for reduction patterns
-            argVal = blockDimXHalf_i32;
-          }
-        }
-        syntheticI32Idx++;
+        argVal = builder.create<LLVM::ConstantOp>(loc, i32Type, 0);
       } else if (argType.isInteger(64)) {
-        // i64 synthetic args: typically loop bounds from Polygeist's GPU lowering
-        // Use total threads = grid_dim.x * block_dim.x
-        argVal = totalThreads_i64;
+        argVal = builder.create<LLVM::ConstantOp>(loc, i64Type, 0);
       } else if (argType.isa<LLVM::LLVMPointerType>()) {
-        // For pointer types (e.g., printf format strings), try to find a global
-        // string constant. Look for globals like @str0, @str1, etc.
-        LLVM::GlobalOp foundGlobal = nullptr;
-        module.walk([&](LLVM::GlobalOp globalOp) {
-          if (globalOp.getName().startswith("str")) {
-            foundGlobal = globalOp;
-            return WalkResult::interrupt();
-          }
-          return WalkResult::advance();
-        });
-
-        if (foundGlobal) {
-          argVal = builder.create<LLVM::AddressOfOp>(loc, ptrType, foundGlobal.getName());
-        } else {
-          // Fallback: create null pointer
-          auto nullVal = builder.create<LLVM::ZeroOp>(loc, ptrType);
-          argVal = nullVal;
-        }
+        argVal = builder.create<LLVM::ZeroOp>(loc, ptrType);
+      } else if (argType.isF32()) {
+        argVal = builder.create<LLVM::ConstantOp>(loc, argType,
+            builder.getFloatAttr(builder.getF32Type(), 0.0));
+      } else if (argType.isF64()) {
+        argVal = builder.create<LLVM::ConstantOp>(loc, argType,
+            builder.getFloatAttr(builder.getF64Type(), 0.0));
       } else {
-        // Default: 0
         argVal = builder.create<LLVM::ConstantOp>(loc, i32Type, 0);
       }
     } else if (isLaunchConfigArg) {

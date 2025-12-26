@@ -80,6 +80,7 @@ void registerGpuSerializeToCubinPass();
 void registerGpuSerializeToHsacoPass();
 
 std::unique_ptr<Pass> createSinkIndexCastsIntoGPULaunchPass();
+std::unique_ptr<Pass> createSinkGpuDimsIntoLaunchPass();
 std::unique_ptr<Pass> createReorderGPUKernelArgsPass();
 std::unique_ptr<Pass> createConvertGPUToVortexPass();
 std::unique_ptr<Pass> createGenerateVortexMainPass();

@@ -20,6 +20,7 @@ add_mlir_dialect_library(MLIRPolygeistTransforms
   ConvertParallelToGPU.cpp
   ConvertGPUToVortex.cpp
   SinkIndexCastsIntoGPULaunch.cpp
+  SinkGpuDimsIntoLaunch.cpp
   ReorderGPUKernelArgs.cpp
   GenerateVortexMain.cpp
   InsertVortexDivergence.cpp

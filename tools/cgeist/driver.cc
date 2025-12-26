@@ -716,7 +716,13 @@ int main(int argc, char **argv) {
         optPM.addPass(mlir::polygeist::createPolygeistCanonicalizePass(
             canonicalizerConfig, {}, {}));
 
-        pm.addPass(mlir::createInlinerPass());
+        // Skip early inlining for CUDA/GPU targets - the inliner can inline
+        // wrapper functions containing gpu.launch before kernel outlining,
+        // creating duplicate kernels with scrambled argument order.
+        // Kernel outlining and a later inliner run in the CUDA lowering block.
+        if (!CudaLower && !EmitGPU) {
+          pm.addPass(mlir::createInlinerPass());
+        }
         mlir::OpPassManager &optPM2 = pm.nest<mlir::func::FuncOp>();
         optPM2.addPass(mlir::polygeist::createPolygeistCanonicalizePass(
             canonicalizerConfig, {}, {}));
@@ -739,15 +745,30 @@ int main(int argc, char **argv) {
       }
     }
 
+    // =========================================================================
+    // GPU Path: Two modes of GPU code generation
+    // =========================================================================
+    // 1. CudaLower: Convert scf.parallel -> gpu.launch (for OpenMP/parallel code)
+    //    Uses ParallelLowerPass and ConvertParallelToGPU passes
+    //
+    // 2. EmitROCM/EmitCUDA with HIP source: gpu.launch already exists from CGCall
+    //    Just need CUDA RT conversion and kernel outlining
+    //
+    // For HIP-to-Vortex compilation (our main use case):
+    // - gpu.launch is created directly in CGCall.cc from <<<>>> syntax
+    // - We skip CudaLower and use EmitGPU path directly
+    // =========================================================================
     if (CudaLower || EmitROCM) {
       mlir::OpPassManager &optPM = pm.nest<mlir::func::FuncOp>();
       optPM.addPass(mlir::createLowerAffinePass());
       optPM.addPass(mlir::polygeist::createPolygeistCanonicalizePass(
           canonicalizerConfig, {}, {}));
       if (CudaLower) {
+        // CudaLower path: Convert scf.parallel to gpu.launch
         pm.addPass(polygeist::createParallelLowerPass(
             /* wrapParallelOps */ EmitGPU, GPUKernelStructureMode));
       }
+      // Convert CUDA runtime calls to GPU dialect ops
       pm.addPass(polygeist::createConvertCudaRTtoGPUPass());
       if (ToCPU.size() > 0) {
         pm.addPass(polygeist::createConvertCudaRTtoCPUPass());
@@ -762,17 +783,32 @@ int main(int argc, char **argv) {
       noptPM.addPass(mlir::polygeist::createPolygeistCanonicalizePass(
           canonicalizerConfig, {}, {}));
 
-      // IMPORTANT: Outline kernels BEFORE the inliner runs.
-      // This preserves kernel argument order by extracting the kernel from
-      // gpu.launch before the inliner can inline the kernel call and scramble
-      // the operand order (getUsedValuesDefinedAbove returns first-use order).
+      // =====================================================================
+      // GPU Kernel Outlining Pipeline
+      // =====================================================================
+      // CRITICAL: Run BEFORE inliner to preserve kernel argument order.
+      // The inliner scrambles operand order (getUsedValuesDefinedAbove returns
+      // first-use order, not declaration order).
+      //
+      // Pass order is important:
+      // 1. Sink constants into gpu.launch (eliminates synthetic args)
+      // 2. Sink index_casts (reduces duplicate args)
+      // 3. Outline kernels to gpu.func
+      // 4. Merge GPU modules
+      // 5. Reorder args to match wrapper function order
+      // =====================================================================
       if (EmitGPU) {
-        // Sink index_cast operations into gpu.launch to reduce kernel parameters.
-        // This prevents duplicate parameters (e.g., count as i32 AND count as index).
+        // 1. Sink constants (loop bounds, initial values) into gpu.launch body
+        pm.addPass(mlir::createGpuLauchSinkIndexComputationsPass());
+        // 2. Sink GPU dimension operations and derived computations
+        pm.addPass(polygeist::createSinkGpuDimsIntoLaunchPass());
+        // 3. Sink index_cast operations to reduce kernel parameters
         pm.addPass(polygeist::createSinkIndexCastsIntoGPULaunchPass());
+        // 4. Extract kernel body from gpu.launch into gpu.func
         pm.addPass(mlir::createGpuKernelOutliningPass());
+        // 5. Merge all gpu.module ops into one
         pm.addPass(polygeist::createMergeGPUModulesPass());
-        // Fix kernel arg order using wrapper function's arg order
+        // 6. Reorder kernel args to match host wrapper function arg order
         pm.addPass(polygeist::createReorderGPUKernelArgsPass());
       }
 
@@ -918,27 +954,20 @@ int main(int argc, char **argv) {
 
 #if POLYGEIST_ENABLE_GPU
     if (EmitGPU) {
+      // NOTE: Kernel outlining, sinking, and reordering are done EARLIER
+      // (around line 775-786) to preserve argument order before inlining.
+      // Only do post-outlining cleanup here.
       pm.addPass(mlir::createCSEPass());
-      if (CudaLower)
+
+      // ConvertParallelToGPU passes are for CudaLower path (scf.parallel -> gpu)
+      // Not needed for HIP path where we already have gpu.launch from CGCall
+      if (CudaLower) {
         pm.addPass(polygeist::createConvertParallelToGPUPass1(
             EmitCUDA ? CUDAGPUArch : AMDGPUArch));
-      // We cannot canonicalize here because we have sunk some operations in the
-      // kernel which the canonicalizer would hoist
+        pm.addPass(polygeist::createConvertParallelToGPUPass2(
+            EmitGPUKernelLaunchBounds));
+      }
 
-      // Sink index_cast operations into gpu.launch to reduce kernel parameters.
-      pm.addPass(polygeist::createSinkIndexCastsIntoGPULaunchPass());
-
-      // TODO pass in gpuDL, the format is weird
-      pm.addPass(mlir::createGpuKernelOutliningPass());
-      pm.addPass(polygeist::createMergeGPUModulesPass());
-      pm.addPass(polygeist::createReorderGPUKernelArgsPass());
-      pm.addPass(mlir::polygeist::createPolygeistCanonicalizePass(
-          canonicalizerConfig, {}, {}));
-      // TODO maybe preserve info about which original kernel corresponds to
-      // which outlined kernel, might be useful for calls to
-      // cudaFuncSetCacheConfig e.g.
-      pm.addPass(polygeist::createConvertParallelToGPUPass2(
-          EmitGPUKernelLaunchBounds));
       pm.addPass(mlir::polygeist::createPolygeistCanonicalizePass(
           canonicalizerConfig, {}, {}));
 

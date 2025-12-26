@@ -335,6 +335,41 @@ def SinkIndexCastsIntoGPULaunch : Pass<"sink-index-casts-into-gpu-launch"> {
   ];
 }
 
+def SinkGpuDimsIntoLaunch : Pass<"sink-gpu-dims-into-launch"> {
+  let summary = "Sink GPU dimension operations into launch regions";
+  let description = [{
+    This pass sinks gpu.block_dim and gpu.grid_dim operations (and their
+    dependent pure computations) into gpu.launch regions before kernel
+    outlining. This eliminates synthetic kernel arguments for dimension values.
+
+    Values that would become synthetic kernel arguments are instead cloned
+    into the launch body, where they become local computations using the
+    gpu.block_dim and gpu.grid_dim operations available inside the launch.
+
+    This pass should run BEFORE gpu-kernel-outlining.
+
+    Example:
+      Before:
+        %bd = gpu.block_dim x
+        %total = arith.muli %gd, %bd : index
+        gpu.launch ... {
+          // uses %total (captured as synthetic arg)
+        }
+
+      After:
+        gpu.launch ... {
+          %bd = gpu.block_dim x
+          %total = arith.muli %gd, %bd : index
+          // uses %total (local computation)
+        }
+  }];
+  let constructor = "mlir::polygeist::createSinkGpuDimsIntoLaunchPass()";
+  let dependentDialects = [
+    "gpu::GPUDialect",
+    "arith::ArithDialect",
+  ];
+}
+
 def ReorderGPUKernelArgs : Pass<"reorder-gpu-kernel-args", "ModuleOp"> {
   let summary = "Reorder GPU kernel arguments to match original HIP kernel signature";
   let description = [{
