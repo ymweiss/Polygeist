@@ -574,6 +574,166 @@ struct ThreadFenceOpLowering : public OpRewritePattern<func::CallOp> {
   }
 };
 
+/// Lower device-side math function calls to LLVM intrinsics
+/// Matches: func.call @sqrtf(f32) -> f32, etc.
+/// Replaces with: llvm.intr.sqrt(f32) -> f32, etc.
+///
+/// This is needed because:
+/// 1. HIP code calls standard C math functions like sqrtf()
+/// 2. These get lowered to func.call operations
+/// 3. There's no device-side library providing these functions
+/// 4. LLVM intrinsics like llvm.sqrt.f32 are lowered to RISC-V fsqrt.s instruction
+struct MathFunctionOpLowering : public OpRewritePattern<func::CallOp> {
+  using OpRewritePattern<func::CallOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(func::CallOp callOp,
+                                 PatternRewriter &rewriter) const override {
+    StringRef name = callOp.getCallee();
+
+    // Only lower inside GPU modules
+    auto gpuModule = callOp->getParentOfType<gpu::GPUModuleOp>();
+    if (!gpuModule)
+      return failure();
+
+    Location loc = callOp.getLoc();
+
+    // Lower sqrtf(f32) -> llvm.intr.sqrt(f32)
+    if (name == "sqrtf") {
+      if (callOp.getNumOperands() != 1 || callOp.getNumResults() != 1)
+        return failure();
+
+      Value arg = callOp.getOperand(0);
+      Type argType = arg.getType();
+
+      // Ensure it's f32
+      if (!argType.isF32())
+        return failure();
+
+      // Create llvm.intr.sqrt operation
+      auto sqrtOp = rewriter.create<LLVM::SqrtOp>(loc, argType, arg);
+      rewriter.replaceOp(callOp, sqrtOp.getResult());
+      return success();
+    }
+
+    // Lower sqrt(f64) -> llvm.intr.sqrt(f64)
+    if (name == "sqrt") {
+      if (callOp.getNumOperands() != 1 || callOp.getNumResults() != 1)
+        return failure();
+
+      Value arg = callOp.getOperand(0);
+      Type argType = arg.getType();
+
+      // Ensure it's f64
+      if (!argType.isF64())
+        return failure();
+
+      auto sqrtOp = rewriter.create<LLVM::SqrtOp>(loc, argType, arg);
+      rewriter.replaceOp(callOp, sqrtOp.getResult());
+      return success();
+    }
+
+    // Lower fabsf(f32) -> llvm.intr.fabs(f32)
+    if (name == "fabsf") {
+      if (callOp.getNumOperands() != 1 || callOp.getNumResults() != 1)
+        return failure();
+
+      Value arg = callOp.getOperand(0);
+      Type argType = arg.getType();
+
+      if (!argType.isF32())
+        return failure();
+
+      auto fabsOp = rewriter.create<LLVM::FAbsOp>(loc, argType, arg);
+      rewriter.replaceOp(callOp, fabsOp.getResult());
+      return success();
+    }
+
+    // Lower fabs(f64) -> llvm.intr.fabs(f64)
+    if (name == "fabs") {
+      if (callOp.getNumOperands() != 1 || callOp.getNumResults() != 1)
+        return failure();
+
+      Value arg = callOp.getOperand(0);
+      Type argType = arg.getType();
+
+      if (!argType.isF64())
+        return failure();
+
+      auto fabsOp = rewriter.create<LLVM::FAbsOp>(loc, argType, arg);
+      rewriter.replaceOp(callOp, fabsOp.getResult());
+      return success();
+    }
+
+    // Lower fminf(f32, f32) -> llvm.intr.minnum(f32, f32)
+    if (name == "fminf") {
+      if (callOp.getNumOperands() != 2 || callOp.getNumResults() != 1)
+        return failure();
+
+      Value lhs = callOp.getOperand(0);
+      Value rhs = callOp.getOperand(1);
+      Type resType = callOp.getResult(0).getType();
+
+      if (!resType.isF32())
+        return failure();
+
+      auto minOp = rewriter.create<LLVM::MinNumOp>(loc, resType, lhs, rhs);
+      rewriter.replaceOp(callOp, minOp.getResult());
+      return success();
+    }
+
+    // Lower fmaxf(f32, f32) -> llvm.intr.maxnum(f32, f32)
+    if (name == "fmaxf") {
+      if (callOp.getNumOperands() != 2 || callOp.getNumResults() != 1)
+        return failure();
+
+      Value lhs = callOp.getOperand(0);
+      Value rhs = callOp.getOperand(1);
+      Type resType = callOp.getResult(0).getType();
+
+      if (!resType.isF32())
+        return failure();
+
+      auto maxOp = rewriter.create<LLVM::MaxNumOp>(loc, resType, lhs, rhs);
+      rewriter.replaceOp(callOp, maxOp.getResult());
+      return success();
+    }
+
+    // Lower floorf(f32) -> llvm.intr.floor(f32)
+    if (name == "floorf") {
+      if (callOp.getNumOperands() != 1 || callOp.getNumResults() != 1)
+        return failure();
+
+      Value arg = callOp.getOperand(0);
+      Type argType = arg.getType();
+
+      if (!argType.isF32())
+        return failure();
+
+      auto floorOp = rewriter.create<LLVM::FFloorOp>(loc, argType, arg);
+      rewriter.replaceOp(callOp, floorOp.getResult());
+      return success();
+    }
+
+    // Lower ceilf(f32) -> llvm.intr.ceil(f32)
+    if (name == "ceilf") {
+      if (callOp.getNumOperands() != 1 || callOp.getNumResults() != 1)
+        return failure();
+
+      Value arg = callOp.getOperand(0);
+      Type argType = arg.getType();
+
+      if (!argType.isF32())
+        return failure();
+
+      auto ceilOp = rewriter.create<LLVM::FCeilOp>(loc, argType, arg);
+      rewriter.replaceOp(callOp, ceilOp.getResult());
+      return success();
+    }
+
+    return failure();
+  }
+};
+
 //===----------------------------------------------------------------------===//
 // Shared Memory Lowering (Address Space 3)
 //===----------------------------------------------------------------------===//
@@ -1354,7 +1514,8 @@ struct ConvertGPUToVortexPass
     // as separate greedy rewrites (these patterns don't replace ops, just annotate)
     RewritePatternSet metadataPatterns(context);
     metadataPatterns.add<LaunchFuncMetadataExtraction, PrintfOpLowering,
-                         ThreadFenceOpLowering, SharedMemoryGlobalOpLowering>(context);
+                         ThreadFenceOpLowering, MathFunctionOpLowering,
+                         SharedMemoryGlobalOpLowering>(context);
     if (failed(applyPatternsAndFoldGreedily(module, std::move(metadataPatterns)))) {
       signalPassFailure();
     }

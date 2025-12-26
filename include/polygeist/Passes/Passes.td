@@ -444,6 +444,39 @@ def GenerateVortexMain : Pass<"generate-vortex-main", "ModuleOp"> {
   ];
 }
 
+def SplitKernelModules : Pass<"split-kernel-modules", "ModuleOp"> {
+  let summary = "Split multi-kernel modules for separate compilation";
+  let description = [{
+    This pass supports multi-kernel HIP programs by extracting individual kernels
+    into separate modules. Each kernel gets its own .vxbin with its own main().
+
+    The pass operates in two modes:
+    1. List mode (no kernel option): Lists all kernel names to stderr
+    2. Extract mode (kernel="name"): Removes all other kernels, keeping only the specified one
+
+    Usage in compile script:
+      # First, list all kernels in the module
+      KERNELS=$(polygeist-opt input.mlir --split-kernel-modules 2>&1 | grep "^KERNEL:")
+
+      # Then extract each kernel into a separate file
+      for K in $KERNELS; do
+        polygeist-opt input.mlir --split-kernel-modules="kernel=$K" -o kernel_$K.mlir
+      done
+
+    This approach ensures each kernel gets its own main() function without requiring
+    the host to coordinate kernel IDs - the less error-prone option for multi-kernel
+    support.
+  }];
+  let constructor = "mlir::polygeist::createSplitKernelModulesPass()";
+  let dependentDialects = [
+    "LLVM::LLVMDialect",
+  ];
+  let options = [
+    Option<"kernel", "kernel", "std::string", /*default=*/"\"\"",
+           "Name of the kernel to extract (if empty, lists all kernels)">
+  ];
+}
+
 def InsertVortexDivergence : Pass<"insert-vortex-divergence", "ModuleOp"> {
   let summary = "Insert vx_split/vx_join around divergent branches for Vortex";
   let description = [{

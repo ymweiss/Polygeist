@@ -704,9 +704,11 @@ struct SplitParallelOp : public OpRewritePattern<polygeist::GPUWrapperOp> {
       // Put a random index, we will override it
       gridArgId.push_back(0);
     } else if (maxThreads != -1 && threadNum <= maxThreads / 2 &&
-               mustBeBlockIVs.empty() && !PreserveOriginalBlockSize) {
+               mustBeBlockIVs.empty() && !PreserveOriginalBlockSize &&
+               blockDims.size() < 3) {
       // If we are not getting enough parallelism in the block, use part of the
-      // grid dims (skip this optimization when preserving original block size)
+      // grid dims (skip this optimization when preserving original block size,
+      // or when we already have 3 block dimensions)
 
       // TODO we have to be careful to not exceed max z dimension in block, it
       // is lower than the 1024 max for the x and y

@@ -482,27 +482,16 @@ std::string HIPSourceTransformer::generateWrapperFunction(const KernelInfo &kern
       }
     }
   }
-  os << "// On host: calls generated stub for proper argument marshaling\n";
-  os << "// On device: uses <<<>>> syntax for Polygeist processing\n";
+  os << "// Generated wrapper for kernel argument order preservation\n";
+  os << "// Uses <<<>>> syntax for GPU compilation (Polygeist/MLIR)\n";
+  os << "// Host compilation uses stub headers directly\n";
+  os << "__attribute__((noinline)) void " << wrapperName << "(" << params << ") {\n";
   os << "#ifdef HIP_HOST_COMPILATION\n";
-
-  // HOST version: call the generated stub function which uses vortexLaunchKernel
-  os << "__attribute__((noinline)) void " << wrapperName << "(" << params << ") {\n";
-  os << "    " << stubName << "(" << gridArg << ", " << blockArg;
-  if (!stubArgs.empty())
-    os << ", " << stubArgs;
-  os << ");\n";
-  os << "}\n";
-
+  os << "    launch_" << kernel.demangledName << "(" << gridArg << ", " << blockArg << ", " << stubArgs << ");\n";
   os << "#else\n";
-
-  // DEVICE version: use kernel launch syntax for Polygeist/MLIR processing
-  // Note: We inline constants here too so MLIR can fold them
-  os << "__attribute__((noinline)) void " << wrapperName << "(" << params << ") {\n";
   os << "    " << kernel.demangledName << "<<<" << gridArg << ", " << blockArg << ">>>(" << kernelArgs << ");\n";
-  os << "}\n";
-
-  os << "#endif\n\n";
+  os << "#endif\n";
+  os << "}\n\n";
 
   return os.str();
 }

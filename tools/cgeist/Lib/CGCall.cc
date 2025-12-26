@@ -254,8 +254,21 @@ ValueCategory MLIRScanner::CallHelper(
   }
 
   if (auto *CU = dyn_cast<CUDAKernelCallExpr>(expr)) {
+    // Debug: Print the kernel being called and current function context
+    if (auto *kfd = CU->getDirectCallee()) {
+      llvm::errs() << "[CGCall] Processing CUDAKernelCallExpr for kernel: "
+                   << kfd->getNameAsString() << "\n";
+    }
+    // Print the current MLIR function we're generating code in
+    if (auto parentFunc = builder.getBlock()->getParentOp()) {
+      if (auto funcOp = dyn_cast<func::FuncOp>(parentFunc)) {
+        llvm::errs() << "[CGCall] In function: " << funcOp.getName() << "\n";
+      }
+    }
+    llvm::errs() << "[CGCall] Step 1: Extracting grid dimensions\n";
     // Extract grid dimensions from kernel launch config
     auto l0 = Visit(CU->getConfig()->getArg(0));
+    llvm::errs() << "[CGCall] Step 1a: Got l0, isReference=" << l0.isReference << "\n";
     assert(l0.isReference);
     mlir::Value blocks[3];
     mlir::Value val = l0.val;
@@ -291,8 +304,10 @@ ValueCategory MLIRScanner::CallHelper(
       }
     }
 
+    llvm::errs() << "[CGCall] Step 2: Extracting block dimensions\n";
     // Extract block dimensions from kernel launch config
     auto t0 = Visit(CU->getConfig()->getArg(1));
+    llvm::errs() << "[CGCall] Step 2a: Got t0, isReference=" << t0.isReference << "\n";
     assert(t0.isReference);
     mlir::Value threads[3];
     val = t0.val;
@@ -330,6 +345,7 @@ ValueCategory MLIRScanner::CallHelper(
 
     // Get the kernel FunctionDecl from the call expression
     const FunctionDecl *kernelFD = CU->getDirectCallee();
+    llvm::errs() << "[CGCall] Step 3: About to create gpu.launch\n";
 
     // Create gpu.launch operation directly with Vortex metadata attached
     // The metadata will be copied to the outlined gpu.func by the kernel outlining pass
@@ -343,12 +359,21 @@ ValueCategory MLIRScanner::CallHelper(
       assert(stream);
       asyncDependencies.push_back(stream);
     }
+    llvm::errs() << "[CGCall] Creating gpu::LaunchOp for kernel call\n";
+    llvm::errs() << "[CGCall]   blocks: [" << blocks[0] << ", " << blocks[1] << ", " << blocks[2] << "]\n";
+    llvm::errs() << "[CGCall]   threads: [" << threads[0] << ", " << threads[1] << ", " << threads[2] << "]\n";
     auto op = builder.create<mlir::gpu::LaunchOp>(
         loc, blocks[0], blocks[1], blocks[2], threads[0], threads[1],
         threads[2],
         /*dynamic shmem size*/ nullptr,
         /*token type*/ stream ? stream.getType() : nullptr,
         /*dependencies*/ asyncDependencies);
+    llvm::errs() << "[CGCall] Created gpu::LaunchOp successfully\n";
+
+    // Mark this gpu.launch as a "launch wrapper" so ParallelLower pass won't
+    // convert it to polygeist::GPUWrapperOp. We want to preserve it as gpu.launch
+    // so kernel outlining can extract it to gpu.func.
+    op->setAttr("polygeist.launch_wrapper", builder.getUnitAttr());
 
     // If this is a __global__ kernel, attach Vortex metadata for argument marshalling
     if (kernelFD && kernelFD->hasAttr<CUDAGlobalAttr>()) {
@@ -376,9 +401,25 @@ ValueCategory MLIRScanner::CallHelper(
     auto oldpoint = builder.getInsertionPoint();
     auto *oldblock = builder.getInsertionBlock();
     builder.setInsertionPointToStart(&op.getRegion().front());
+    llvm::errs() << "[CGCall] Creating CallOp inside gpu.launch to function: "
+                 << tocall.getName() << "\n";
+    llvm::errs() << "[CGCall]   tocall function has "
+                 << tocall.getBody().getBlocks().size() << " blocks\n";
     builder.create<CallOp>(loc, tocall, args);
     builder.create<gpu::TerminatorOp>(loc);
     builder.setInsertionPoint(oldblock, oldpoint);
+
+    // Debug: Verify gpu.launch is in the function
+    if (auto parentFunc = builder.getBlock()->getParentOp()) {
+      if (auto funcOp = dyn_cast<func::FuncOp>(parentFunc)) {
+        llvm::errs() << "[CGCall] Function " << funcOp.getName() << " after gpu.launch creation:\n";
+        int opCount = 0;
+        for (Operation &op : funcOp.getBody().front()) {
+          llvm::errs() << "[CGCall]   Op #" << opCount++ << ": " << op.getName() << "\n";
+        }
+      }
+    }
+
     return nullptr;
   }
 
@@ -1939,6 +1980,10 @@ ValueCategory MLIRScanner::VisitCallExpr(clang::CallExpr *expr) {
             /*dynamic shmem size*/ nullptr,
             /*token type*/ stream ? stream.getType() : nullptr,
             /*dependencies*/ asyncDependencies);
+        // Mark this gpu.launch as a "launch wrapper" so ParallelLower pass won't
+        // convert it to polygeist::GPUWrapperOp. We want to preserve it as gpu.launch
+        // so kernel outlining can extract it to gpu.func.
+        op->setAttr("polygeist.launch_wrapper", builder.getUnitAttr());
         oldpoint = builder.getInsertionPoint();
         oldblock = builder.getInsertionBlock();
         builder.setInsertionPointToStart(&op.getRegion().front());

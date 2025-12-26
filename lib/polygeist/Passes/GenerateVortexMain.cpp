@@ -79,9 +79,22 @@ static LLVM::LLVMFuncOp findKernelFunction(ModuleOp module) {
 
   module.walk([&](LLVM::LLVMFuncOp func) {
     StringRef name = func.getName();
-    // Look for functions with "_kernel" in the name (Polygeist naming convention)
-    // or functions that were marked as kernels
-    if (name.contains("_kernel") && !name.startswith("kernel_body")) {
+
+    // Skip kernel_body wrappers (these are what we generate, not inputs)
+    if (name.startswith("kernel_body"))
+      return;
+
+    // Primary check: has kernel_arg_mapping attribute (most reliable)
+    // This attribute is set by ConvertGPUToVortex/ReorderGPUKernelArgs passes
+    bool isKernel = func->hasAttr("kernel_arg_mapping");
+
+    // Fallback check: name contains "kernel" with optional leading underscore
+    // Matches: "_kernel", "kernel_", "foo_kernel", "kernel_iadd", etc.
+    if (!isKernel) {
+      isKernel = name.contains("_kernel") || name.contains("kernel_");
+    }
+
+    if (isKernel) {
       // Check for main_kernel
       if (name == "main_kernel") {
         mainKernel = func;
