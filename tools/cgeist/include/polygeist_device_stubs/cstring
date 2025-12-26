@@ -1,0 +1,34 @@
+// Polygeist device stub for <cstring>
+// This stub intercepts <cstring> during CUDA/HIP device compilation.
+
+#ifndef __POLYGEIST_DEVICE_STUBS_CSTRING
+#define __POLYGEIST_DEVICE_STUBS_CSTRING
+
+#ifdef __CUDA_ARCH__
+// Device compilation: provide minimal stubs
+#include <cstddef>
+
+extern "C" {
+  extern void* memcpy(void* dest, const void* src, size_t n);
+  extern void* memset(void* s, int c, size_t n);
+  extern int memcmp(const void* s1, const void* s2, size_t n);
+  extern size_t strlen(const char* s);
+  extern int strcmp(const char* s1, const char* s2);
+  extern char* strcpy(char* dest, const char* src);
+}
+
+namespace std {
+  using ::memcpy;
+  using ::memset;
+  using ::memcmp;
+  using ::strlen;
+  using ::strcmp;
+  using ::strcpy;
+}
+
+#else
+// Host compilation: include the real header
+#include_next <cstring>
+#endif
+
+#endif // __POLYGEIST_DEVICE_STUBS_CSTRING

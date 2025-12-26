@@ -1,0 +1,46 @@
+// Polygeist device stub for <algorithm>
+// Provides minimal algorithm functions for device compilation.
+
+#ifndef __POLYGEIST_DEVICE_STUBS_ALGORITHM
+#define __POLYGEIST_DEVICE_STUBS_ALGORITHM
+
+#ifdef __CUDA_ARCH__
+// During device compilation: provide minimal implementations
+// Use __host__ __device__ to be compatible with device math functions
+
+#ifndef __host__
+#define __host__ __attribute__((host))
+#endif
+#ifndef __device__
+#define __device__ __attribute__((device))
+#endif
+
+namespace std {
+  // Standard C++ style: const reference versions only
+  template<typename T>
+  __host__ __device__ inline const T& min(const T& a, const T& b) { return a < b ? a : b; }
+
+  template<typename T>
+  __host__ __device__ inline const T& max(const T& a, const T& b) { return a > b ? a : b; }
+
+  template<typename T, typename Compare>
+  __host__ __device__ inline const T& min(const T& a, const T& b, Compare comp) { return comp(a, b) ? a : b; }
+
+  template<typename T, typename Compare>
+  __host__ __device__ inline const T& max(const T& a, const T& b, Compare comp) { return comp(b, a) ? a : b; }
+
+  // swap
+  template<typename T>
+  __host__ __device__ inline void swap(T& a, T& b) {
+    T tmp = a;
+    a = b;
+    b = tmp;
+  }
+}
+
+#else
+// Pure host compilation: include the real header
+#include_next <algorithm>
+#endif
+
+#endif // __POLYGEIST_DEVICE_STUBS_ALGORITHM

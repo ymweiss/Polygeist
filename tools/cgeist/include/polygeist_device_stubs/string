@@ -1,0 +1,21 @@
+/*===-- string - Polygeist device stub for <string> -----------------------===*\
+|*                                                                            *|
+|* Part of the Polygeist Project, under the Apache License v2.0               *|
+|* See https://llvm.org/LICENSE.txt for license information.                  *|
+|*                                                                            *|
+|* This stub header provides an empty replacement for <string> during         *|
+|* CUDA/HIP device compilation. Device code does not use std::string.         *|
+|*                                                                            *|
+\*===----------------------------------------------------------------------===*/
+
+#ifndef __POLYGEIST_DEVICE_STUBS_STRING
+#define __POLYGEIST_DEVICE_STUBS_STRING
+
+#ifdef __CUDA_ARCH__
+// Device compilation: empty stub (device code doesn't use string)
+#else
+// Host compilation: include the real header
+#include_next <string>
+#endif
+
+#endif // __POLYGEIST_DEVICE_STUBS_STRING

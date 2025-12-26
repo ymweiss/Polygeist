@@ -1,0 +1,21 @@
+/*===-- ostream - Polygeist device stub for <ostream> ---------------------===*\
+|*                                                                            *|
+|* Part of the Polygeist Project, under the Apache License v2.0               *|
+|* See https://llvm.org/LICENSE.txt for license information.                  *|
+|*                                                                            *|
+|* This stub header provides an empty replacement for <ostream> during        *|
+|* CUDA/HIP device compilation. Device code does not use output streams.      *|
+|*                                                                            *|
+\*===----------------------------------------------------------------------===*/
+
+#ifndef __POLYGEIST_DEVICE_STUBS_OSTREAM
+#define __POLYGEIST_DEVICE_STUBS_OSTREAM
+
+#ifdef __CUDA_ARCH__
+// Device compilation: empty stub (device code doesn't use ostream)
+#else
+// Host compilation: include the real header
+#include_next <ostream>
+#endif
+
+#endif // __POLYGEIST_DEVICE_STUBS_OSTREAM

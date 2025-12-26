@@ -29,7 +29,9 @@ add_clang_executable(cgeist
   Lib/utils.cc
   Lib/IfScope.cc
   Lib/TypeUtils.cc
-  Lib/CGCall.cc 
+  Lib/CGCall.cc
+  Lib/HIPKernelAnalysis.cc
+  Lib/HIPSourceTransform.cc
 )
 if(POLYGEIST_ENABLE_CUDA OR POLYGEIST_CUDA_FRONTEND_ONLY)
   target_compile_definitions(cgeist
@@ -57,6 +59,16 @@ install(TARGETS cgeist
 EXPORT PolygeistTargets
 RUNTIME DESTINATION ${LLVM_TOOLS_INSTALL_DIR}
 COMPONENT cgeist)
+
+# Install polygeist device stub headers for CUDA/HIP compilation
+# These stubs intercept problematic STL headers during device compilation
+install(DIRECTORY include/polygeist_device_stubs
+        DESTINATION include
+        COMPONENT cgeist)
+
+# Copy stubs to build directory for development/testing
+file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/include/polygeist_device_stubs"
+     DESTINATION "${CMAKE_CURRENT_BINARY_DIR}/include")
 
 target_include_directories(cgeist PRIVATE
   "${LLVM_SOURCE_DIR}/../clang/include"
@@ -136,6 +148,7 @@ list(APPEND CGEIST_LIBS
   clangFrontend
   clangFrontendTool
   clangLex
+  clangRewrite
   clangSerialization
 )
 

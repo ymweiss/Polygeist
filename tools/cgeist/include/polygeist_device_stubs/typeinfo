@@ -1,0 +1,38 @@
+/*===-- typeinfo - Polygeist device stub for <typeinfo> -------------------===*\
+|*                                                                            *|
+|* Part of the Polygeist Project, under the Apache License v2.0               *|
+|* See https://llvm.org/LICENSE.txt for license information.                  *|
+|*                                                                            *|
+|* This stub provides minimal declarations during CUDA/HIP device             *|
+|* compilation to allow host code using typeid to parse without errors.       *|
+|*                                                                            *|
+\*===----------------------------------------------------------------------===*/
+
+#ifndef __POLYGEIST_DEVICE_STUBS_TYPEINFO
+#define __POLYGEIST_DEVICE_STUBS_TYPEINFO
+
+#ifdef __CUDA__
+// CUDA compilation: provide minimal type_info stub
+// This allows typeid usage in host code to parse during device compilation
+
+namespace std {
+  class type_info {
+  public:
+    const char* name() const noexcept { return ""; }
+    bool operator==(const type_info& other) const noexcept { return true; }
+    bool operator!=(const type_info& other) const noexcept { return false; }
+    bool before(const type_info& other) const noexcept { return false; }
+    size_t hash_code() const noexcept { return 0; }
+  protected:
+    type_info() = default;
+    type_info(const type_info&) = delete;
+    type_info& operator=(const type_info&) = delete;
+  };
+}
+
+#else
+// Host compilation: include the real header
+#include_next <typeinfo>
+#endif
+
+#endif // __POLYGEIST_DEVICE_STUBS_TYPEINFO

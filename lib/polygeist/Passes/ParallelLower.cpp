@@ -408,7 +408,11 @@ void ParallelLower::runOnOperation() {
 
   SmallVector<gpu::LaunchOp> toHandle;
   getOperation().walk(
-      [&](gpu::LaunchOp launchOp) { toHandle.push_back(launchOp); });
+      [&](gpu::LaunchOp launchOp) {
+        // Skip launch wrappers - they should be preserved for host-side calling
+        if (!launchOp->hasAttr("polygeist.launch_wrapper"))
+          toHandle.push_back(launchOp);
+      });
   for (gpu::LaunchOp launchOp : toHandle) {
     {
       SmallVector<CallOp> ops;

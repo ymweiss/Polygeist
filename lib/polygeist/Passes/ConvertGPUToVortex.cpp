@@ -18,6 +18,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
@@ -401,6 +402,77 @@ struct BarrierOpLowering : public ConvertOpToLLVMPattern<gpu::BarrierOp> {
   }
 };
 
+/// Lower nvvm.barrier0 to Vortex vx_barrier call
+/// Synchronizes all threads in a block using Vortex hardware barriers
+/// This handles the case where __syncthreads() is lowered to nvvm.barrier0
+/// instead of gpu.barrier
+struct NVVMBarrier0OpLowering : public ConvertOpToLLVMPattern<NVVM::Barrier0Op> {
+  using ConvertOpToLLVMPattern<NVVM::Barrier0Op>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(NVVM::Barrier0Op op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    // Declare functions in gpu.module (not top-level module) so they're visible
+    auto gpuModule = op->getParentOfType<gpu::GPUModuleOp>();
+    if (!gpuModule)
+      return failure();
+    MLIRContext *context = gpuModule.getContext();
+
+    // Allocate barrier ID (simple counter for now)
+    // TODO: Proper barrier ID allocation to avoid conflicts
+    static int barrierIdCounter = 0;
+    int barrierId = barrierIdCounter++;
+
+    // Create barrier ID constant
+    auto i32Type = rewriter.getI32Type();
+    auto barIdConstant = rewriter.create<LLVM::ConstantOp>(
+        loc, i32Type, rewriter.getI32IntegerAttr(barrierId));
+
+    // Declare vx_num_warps_abi function in gpu.module if not already declared
+    auto vxNumWarpsFunc = gpuModule.lookupSymbol<LLVM::LLVMFuncOp>("vx_num_warps_abi");
+    if (!vxNumWarpsFunc) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(gpuModule.getBody());
+
+      auto funcType = LLVM::LLVMFunctionType::get(
+          i32Type, {}, /*isVarArg=*/false);
+
+      vxNumWarpsFunc = rewriter.create<LLVM::LLVMFuncOp>(
+          gpuModule.getLoc(), "vx_num_warps_abi", funcType);
+    }
+
+    // Call vx_num_warps_abi() to get number of warps
+    auto numWarps = rewriter.create<LLVM::CallOp>(
+        loc, vxNumWarpsFunc, ValueRange{});
+
+    // Declare vx_barrier_abi function in gpu.module if not already declared
+    auto vxBarrierFunc = gpuModule.lookupSymbol<LLVM::LLVMFuncOp>("vx_barrier_abi");
+    if (!vxBarrierFunc) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(gpuModule.getBody());
+
+      auto funcType = LLVM::LLVMFunctionType::get(
+          LLVM::LLVMVoidType::get(context),
+          {i32Type, i32Type},
+          /*isVarArg=*/false);
+
+      vxBarrierFunc = rewriter.create<LLVM::LLVMFuncOp>(
+          gpuModule.getLoc(), "vx_barrier_abi", funcType);
+    }
+
+    // Call vx_barrier_abi(barrier_id, num_warps)
+    SmallVector<Value> args;
+    args.push_back(barIdConstant.getResult());
+    args.push_back(numWarps.getResult());
+
+    rewriter.replaceOpWithNewOp<LLVM::CallOp>(
+        op, vxBarrierFunc, args);
+
+    return success();
+  }
+};
+
 /// Lower printf calls to vx_printf
 /// Matches: llvm.call @printf(format, args...)
 /// Replaces with: llvm.call @vx_printf(format, args...)
@@ -451,6 +523,214 @@ struct PrintfOpLowering : public OpRewritePattern<LLVM::CallOp> {
         callOp, vxPrintfFunc, newArgs);
 
     return success();
+  }
+};
+
+/// Lower __threadfence* calls to RISC-V fence instructions
+/// Matches: func.call @__threadfence* (void)
+/// Replaces with: llvm.inline_asm "fence rw, rw" or "fence iorw, iorw"
+///
+/// Fence semantics:
+/// - __threadfence_block(): Orders memory accesses for all threads within a block
+/// - __threadfence(): Orders memory accesses for all threads on the device
+/// - __threadfence_system(): Orders memory accesses visible to other devices and host
+struct ThreadFenceOpLowering : public OpRewritePattern<func::CallOp> {
+  using OpRewritePattern<func::CallOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(func::CallOp callOp,
+                                 PatternRewriter &rewriter) const override {
+    StringRef name = callOp.getCallee();
+
+    // Match fence function names and determine instruction
+    StringRef fenceAsm;
+    if (name == "__threadfence" || name == "__threadfence_block") {
+      // Block and device scope use same instruction on Vortex (single-core)
+      fenceAsm = "fence rw, rw";
+    } else if (name == "__threadfence_system") {
+      // System scope includes I/O for visibility to host/other devices
+      fenceAsm = "fence iorw, iorw";
+    } else {
+      return failure();
+    }
+
+    // Only lower inside GPU modules
+    auto gpuModule = callOp->getParentOfType<gpu::GPUModuleOp>();
+    if (!gpuModule)
+      return failure();
+
+    // Emit RISC-V fence inline assembly
+    rewriter.replaceOpWithNewOp<LLVM::InlineAsmOp>(
+        callOp,
+        /*res=*/TypeRange{},
+        /*operands=*/ValueRange{},
+        /*asm_string=*/fenceAsm,
+        /*constraints=*/"",
+        /*has_side_effects=*/true,
+        /*is_align_stack=*/false,
+        /*asm_dialect=*/LLVM::AsmDialectAttr{},
+        /*operand_attrs=*/ArrayAttr{});
+
+    return success();
+  }
+};
+
+/// Lower device-side math function calls to LLVM intrinsics
+/// Matches: func.call @sqrtf(f32) -> f32, etc.
+/// Replaces with: llvm.intr.sqrt(f32) -> f32, etc.
+///
+/// This is needed because:
+/// 1. HIP code calls standard C math functions like sqrtf()
+/// 2. These get lowered to func.call operations
+/// 3. There's no device-side library providing these functions
+/// 4. LLVM intrinsics like llvm.sqrt.f32 are lowered to RISC-V fsqrt.s instruction
+struct MathFunctionOpLowering : public OpRewritePattern<func::CallOp> {
+  using OpRewritePattern<func::CallOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(func::CallOp callOp,
+                                 PatternRewriter &rewriter) const override {
+    StringRef name = callOp.getCallee();
+
+    // Only lower inside GPU modules
+    auto gpuModule = callOp->getParentOfType<gpu::GPUModuleOp>();
+    if (!gpuModule)
+      return failure();
+
+    Location loc = callOp.getLoc();
+
+    // Lower sqrtf(f32) -> llvm.intr.sqrt(f32)
+    if (name == "sqrtf") {
+      if (callOp.getNumOperands() != 1 || callOp.getNumResults() != 1)
+        return failure();
+
+      Value arg = callOp.getOperand(0);
+      Type argType = arg.getType();
+
+      // Ensure it's f32
+      if (!argType.isF32())
+        return failure();
+
+      // Create llvm.intr.sqrt operation
+      auto sqrtOp = rewriter.create<LLVM::SqrtOp>(loc, argType, arg);
+      rewriter.replaceOp(callOp, sqrtOp.getResult());
+      return success();
+    }
+
+    // Lower sqrt(f64) -> llvm.intr.sqrt(f64)
+    if (name == "sqrt") {
+      if (callOp.getNumOperands() != 1 || callOp.getNumResults() != 1)
+        return failure();
+
+      Value arg = callOp.getOperand(0);
+      Type argType = arg.getType();
+
+      // Ensure it's f64
+      if (!argType.isF64())
+        return failure();
+
+      auto sqrtOp = rewriter.create<LLVM::SqrtOp>(loc, argType, arg);
+      rewriter.replaceOp(callOp, sqrtOp.getResult());
+      return success();
+    }
+
+    // Lower fabsf(f32) -> llvm.intr.fabs(f32)
+    if (name == "fabsf") {
+      if (callOp.getNumOperands() != 1 || callOp.getNumResults() != 1)
+        return failure();
+
+      Value arg = callOp.getOperand(0);
+      Type argType = arg.getType();
+
+      if (!argType.isF32())
+        return failure();
+
+      auto fabsOp = rewriter.create<LLVM::FAbsOp>(loc, argType, arg);
+      rewriter.replaceOp(callOp, fabsOp.getResult());
+      return success();
+    }
+
+    // Lower fabs(f64) -> llvm.intr.fabs(f64)
+    if (name == "fabs") {
+      if (callOp.getNumOperands() != 1 || callOp.getNumResults() != 1)
+        return failure();
+
+      Value arg = callOp.getOperand(0);
+      Type argType = arg.getType();
+
+      if (!argType.isF64())
+        return failure();
+
+      auto fabsOp = rewriter.create<LLVM::FAbsOp>(loc, argType, arg);
+      rewriter.replaceOp(callOp, fabsOp.getResult());
+      return success();
+    }
+
+    // Lower fminf(f32, f32) -> llvm.intr.minnum(f32, f32)
+    if (name == "fminf") {
+      if (callOp.getNumOperands() != 2 || callOp.getNumResults() != 1)
+        return failure();
+
+      Value lhs = callOp.getOperand(0);
+      Value rhs = callOp.getOperand(1);
+      Type resType = callOp.getResult(0).getType();
+
+      if (!resType.isF32())
+        return failure();
+
+      auto minOp = rewriter.create<LLVM::MinNumOp>(loc, resType, lhs, rhs);
+      rewriter.replaceOp(callOp, minOp.getResult());
+      return success();
+    }
+
+    // Lower fmaxf(f32, f32) -> llvm.intr.maxnum(f32, f32)
+    if (name == "fmaxf") {
+      if (callOp.getNumOperands() != 2 || callOp.getNumResults() != 1)
+        return failure();
+
+      Value lhs = callOp.getOperand(0);
+      Value rhs = callOp.getOperand(1);
+      Type resType = callOp.getResult(0).getType();
+
+      if (!resType.isF32())
+        return failure();
+
+      auto maxOp = rewriter.create<LLVM::MaxNumOp>(loc, resType, lhs, rhs);
+      rewriter.replaceOp(callOp, maxOp.getResult());
+      return success();
+    }
+
+    // Lower floorf(f32) -> llvm.intr.floor(f32)
+    if (name == "floorf") {
+      if (callOp.getNumOperands() != 1 || callOp.getNumResults() != 1)
+        return failure();
+
+      Value arg = callOp.getOperand(0);
+      Type argType = arg.getType();
+
+      if (!argType.isF32())
+        return failure();
+
+      auto floorOp = rewriter.create<LLVM::FFloorOp>(loc, argType, arg);
+      rewriter.replaceOp(callOp, floorOp.getResult());
+      return success();
+    }
+
+    // Lower ceilf(f32) -> llvm.intr.ceil(f32)
+    if (name == "ceilf") {
+      if (callOp.getNumOperands() != 1 || callOp.getNumResults() != 1)
+        return failure();
+
+      Value arg = callOp.getOperand(0);
+      Type argType = arg.getType();
+
+      if (!argType.isF32())
+        return failure();
+
+      auto ceilOp = rewriter.create<LLVM::FCeilOp>(loc, argType, arg);
+      rewriter.replaceOp(callOp, ceilOp.getResult());
+      return success();
+    }
+
+    return failure();
   }
 };
 
@@ -746,6 +1026,8 @@ struct KernelArgInfo {
   unsigned size;     // Size in bytes
   unsigned offset;   // Offset in args struct
   bool isPointer;
+  bool isSynthetic = false;  // True for Polygeist-generated args (loop bounds)
+  int sourceArg = -1;        // For synthetic args: which user arg to derive value from
 };
 
 /// Structure to hold complete kernel metadata
@@ -796,7 +1078,22 @@ static std::string getCTypeString(const std::string &metaType) {
   return "uint32_t";  // Default
 }
 
-/// Generate C header string for kernel args struct (Vortex-compatible)
+/// Convert metadata type to C type for function parameters (host ABI)
+/// Unlike getCTypeString (for packed struct), this uses void* for pointers
+static std::string getHostParamTypeString(const std::string &metaType, bool isPointer) {
+  if (isPointer) return "const void*";  // Host pointers are void*
+  if (metaType == "i32") return "int32_t";
+  if (metaType == "u32") return "uint32_t";
+  if (metaType == "i64") return "int64_t";
+  if (metaType == "u64") return "uint64_t";
+  if (metaType == "f32") return "float";
+  if (metaType == "f64") return "double";
+  if (metaType == "ptr") return "const void*";
+  return "uint32_t";  // Default
+}
+
+/// Generate C++ header string with complete host stub (Vortex-compatible)
+/// Includes: args struct, metadata array, and inline launcher function
 static std::string generateKernelArgsHeader(const KernelMetadata &meta) {
   std::ostringstream header;
 
@@ -805,23 +1102,92 @@ static std::string generateKernelArgsHeader(const KernelMetadata &meta) {
   std::transform(guardName.begin(), guardName.end(), guardName.begin(), ::toupper);
   std::replace(guardName.begin(), guardName.end(), '-', '_');
 
-  header << "// Auto-generated kernel argument structure for " << meta.kernelName << "\n";
+  header << "// Auto-generated host stub for " << meta.kernelName << "\n";
   header << "// Generated by Polygeist ConvertGPUToVortex pass\n";
+  header << "// Include after hip_vortex_runtime.h\n";
   header << "#ifndef " << guardName << "_ARGS_H\n";
   header << "#define " << guardName << "_ARGS_H\n\n";
   header << "#include <stdint.h>\n\n";
 
-  header << "typedef struct {\n";
+  // Check that runtime header was included
+  header << "#ifndef HIP_VORTEX_RUNTIME_H\n";
+  header << "#error \"" << meta.kernelName << "_args.h must be included after hip_vortex_runtime.h\"\n";
+  header << "#endif\n\n";
+
+  // 1. Generate packed args struct (using void* for pointers on host)
+  header << "// Argument structure for " << meta.kernelName << "\n";
+  header << "// Pointers stored as void* (host format, converted by vortexLaunchKernel)\n";
+  header << "typedef struct __attribute__((packed)) {\n";
+
+  // Compute host offsets (void* is 8 bytes on 64-bit)
+  unsigned hostOffset = 0;
   for (const auto &arg : meta.arguments) {
-    std::string cType = getCTypeString(arg.type);
+    std::string cType;
+    unsigned hostSize;
+    if (arg.isPointer) {
+      cType = "void*";
+      hostSize = 8;  // 64-bit host pointer
+    } else {
+      cType = getCTypeString(arg.type);
+      hostSize = arg.size;
+    }
     header << "  " << cType << " " << arg.name << ";";
-    header << "  // offset=" << arg.offset << ", size=" << arg.size;
+    header << "  // host_offset=" << hostOffset << ", host_size=" << hostSize;
     if (arg.isPointer) header << ", device pointer";
     header << "\n";
+    hostOffset += hostSize;
   }
   header << "} " << meta.kernelName << "_args_t;\n\n";
 
-  header << "#define " << guardName << "_ARGS_SIZE " << meta.totalArgsSize << "\n\n";
+  // 2. Generate metadata array for vortexLaunchKernel
+  header << "// Metadata array for vortexLaunchKernel\n";
+  header << "// Offsets are for host struct (sizeof(void*) = 8 on 64-bit)\n";
+  header << "static const VortexKernelArgMeta " << meta.kernelName << "_metadata[] = {\n";
+
+  hostOffset = 0;
+  for (const auto &arg : meta.arguments) {
+    unsigned hostSize = arg.isPointer ? 8 : arg.size;  // void* is 8 bytes on host
+    header << "  { .offset = " << hostOffset
+           << ", .size = " << hostSize
+           << ", .is_pointer = " << (arg.isPointer ? "1" : "0")
+           << " },  // " << arg.name << "\n";
+    hostOffset += hostSize;
+  }
+  header << "};\n";
+  header << "#define " << guardName << "_NUM_ARGS " << meta.arguments.size() << "\n\n";
+
+  // 3. Generate inline launcher function
+  header << "// Type-safe launcher for " << meta.kernelName << "\n";
+  header << "// Call this from host code with original argument types\n";
+  header << "static inline hipError_t launch_" << meta.kernelName << "(\n";
+  header << "    dim3 gridDim, dim3 blockDim";
+
+  // Function parameters
+  for (const auto &arg : meta.arguments) {
+    std::string paramType = getHostParamTypeString(arg.type, arg.isPointer);
+    header << ",\n    " << paramType << " " << arg.name;
+  }
+  header << ") {\n\n";
+
+  // Pack arguments into struct
+  header << "  " << meta.kernelName << "_args_t args;\n";
+  for (const auto &arg : meta.arguments) {
+    if (arg.isPointer) {
+      header << "  args." << arg.name << " = (void*)" << arg.name << ";\n";
+    } else {
+      header << "  args." << arg.name << " = " << arg.name << ";\n";
+    }
+  }
+  header << "\n";
+
+  // Call vortexLaunchKernel
+  header << "  return vortexLaunchKernel(\n";
+  header << "    \"" << meta.kernelName << "\",\n";
+  header << "    gridDim, blockDim,\n";
+  header << "    &args, sizeof(args),\n";
+  header << "    " << meta.kernelName << "_metadata, " << guardName << "_NUM_ARGS);\n";
+  header << "}\n\n";
+
   header << "#endif // " << guardName << "_ARGS_H\n";
 
   return header.str();
@@ -873,7 +1239,8 @@ static std::string generateMetadataJSON(const KernelMetadata &meta,
 /// Extract metadata from a GPU function and write metadata files
 /// Generates both .meta.json (for runtime) and _args.h (for compile-time)
 /// If outputDir is empty, uses current working directory
-/// Uses kernel_arg_mapping attribute to identify which kernel args are user args
+/// Prioritizes vortex.kernel_args attribute (original HIP order from AST)
+/// Falls back to kernel_arg_mapping + MLIR types if not available
 static void emitKernelMetadata(gpu::GPUFuncOp funcOp, StringRef outputDir) {
   if (!funcOp.isKernel())
     return;
@@ -881,71 +1248,178 @@ static void emitKernelMetadata(gpu::GPUFuncOp funcOp, StringRef outputDir) {
   KernelMetadata meta;
   meta.kernelName = funcOp.getName().str();
 
-  // Extract base kernel name (remove Polygeist suffix if present)
-  StringRef baseName = extractBaseKernelName(funcOp.getName());
-  meta.kernelName = baseName.str();
+  // PRIORITY 0: Check for vortex.kernel_name attribute (set by ReorderGPUKernelArgsPass)
+  // This contains the ORIGINAL HIP kernel name before inlining/outlining mangled it
+  if (auto kernelNameAttr = funcOp->getAttrOfType<StringAttr>("vortex.kernel_name")) {
+    meta.kernelName = kernelNameAttr.getValue().str();
+    llvm::outs() << "Using vortex.kernel_name attribute: " << meta.kernelName << "\n";
+  } else {
+    // Extract base kernel name (remove Polygeist suffix if present)
+    StringRef baseName = extractBaseKernelName(funcOp.getName());
+    meta.kernelName = baseName.str();
+    llvm::outs() << "Using function name: " << meta.kernelName << "\n";
+  }
 
-  auto argTypes = funcOp.getArgumentTypes();
-  unsigned totalArgs = argTypes.size();
+  // PRIORITY 1: Use vortex.kernel_args attribute if available
+  // This contains the ORIGINAL HIP argument order from AST, which is what the
+  // host code expects. The MLIR function signature may have reordered args.
+  if (auto vortexArgsAttr = funcOp->getAttrOfType<ArrayAttr>("vortex.kernel_args")) {
+    llvm::outs() << "Using vortex.kernel_args attribute for " << meta.kernelName
+                 << " (original HIP argument order)\n";
 
-  // Use kernel_arg_mapping attribute to identify user args
-  // The mapping tells us which host wrapper arg each kernel arg came from.
-  // Host wrapper signature is: (user_args..., gridDim, blockDim)
-  // So any kernel arg that maps to host arg index < (total_host_args - 2) is a user arg.
-  SmallVector<unsigned> userArgIndices;
+    unsigned offset = 0;
+    for (auto argAttr : vortexArgsAttr) {
+      auto argDict = argAttr.dyn_cast<DictionaryAttr>();
+      if (!argDict) continue;
 
-  if (auto mappingAttr = funcOp->getAttrOfType<DenseI64ArrayAttr>("kernel_arg_mapping")) {
-    auto mapping = mappingAttr.asArrayRef();
+      KernelArgInfo argInfo;
 
-    // Find the max host arg index to determine host wrapper arg count
-    int64_t maxHostArg = -1;
-    for (int64_t idx : mapping) {
-      if (idx > maxHostArg) maxHostArg = idx;
+      // Extract name
+      if (auto nameAttr = argDict.getAs<StringAttr>("name"))
+        argInfo.name = nameAttr.getValue().str();
+      else
+        argInfo.name = "arg" + std::to_string(meta.arguments.size());
+
+      // Extract type string
+      if (auto typeAttr = argDict.getAs<StringAttr>("type"))
+        argInfo.type = typeAttr.getValue().str();
+      else
+        argInfo.type = "unknown";
+
+      // Extract size (from AST, this is host size - we need device size)
+      // For pointers: host=8 bytes (64-bit), device=4 bytes (RV32)
+      if (auto sizeAttr = argDict.getAs<IntegerAttr>("size"))
+        argInfo.size = sizeAttr.getInt();
+      else
+        argInfo.size = 4;
+
+      // Check if pointer
+      if (auto isPtrAttr = argDict.getAs<BoolAttr>("is_pointer"))
+        argInfo.isPointer = isPtrAttr.getValue();
+      else
+        argInfo.isPointer = (argInfo.type.find('*') != std::string::npos);
+
+      // For device struct, pointers are 4 bytes (RV32), not 8 bytes
+      unsigned deviceSize = argInfo.isPointer ? 4 : argInfo.size;
+
+      // Compute offset (recalculate for device layout)
+      argInfo.offset = offset;
+      offset += deviceSize;
+      // Update size to device size for the metadata
+      argInfo.size = deviceSize;
+
+      meta.arguments.push_back(argInfo);
     }
-    unsigned hostArgCount = static_cast<unsigned>(maxHostArg + 1);
+    meta.totalArgsSize = offset;
 
-    // User args are those in host wrapper positions 0...(hostArgCount - 3)
-    // Last 2 host args are gridDim and blockDim
-    unsigned userArgThreshold = (hostArgCount >= 2) ? hostArgCount - 2 : 0;
+  } else {
+    // PRIORITY 2: Fall back to kernel_arg_mapping + MLIR function types
+    // This path is used when vortex.kernel_args attribute is not propagated
+    llvm::outs() << "Falling back to kernel_arg_mapping for " << meta.kernelName << "\n";
 
-    // Collect kernel arg indices that map to user args
-    // Use a set to track which host args we've already seen (for deduplication)
-    llvm::SmallSet<int64_t, 8> seenHostArgs;
-    for (unsigned i = 0; i < mapping.size(); ++i) {
-      int64_t hostIdx = mapping[i];
-      if (hostIdx >= 0 && static_cast<unsigned>(hostIdx) < userArgThreshold) {
-        if (seenHostArgs.insert(hostIdx).second) {
-          userArgIndices.push_back(i);
-        }
+    auto argTypes = funcOp.getArgumentTypes();
+    unsigned totalArgs = argTypes.size();
+
+    // Check for synthetic args (not user args):
+    // - llvm.ptr: captured globals (e.g., printf format strings) - SKIP these
+    // - index: loop bounds that Polygeist hoists into kernel parameters - INCLUDE these
+    //
+    // Captured globals are handled by Polygeist and don't need host data.
+    // Index args (loop bounds) need buffer space and values derived from user args.
+    //
+    // Count synthetic args by type:
+    unsigned numSyntheticPtrArgs = 0;  // llvm.ptr - skip from metadata
+    unsigned numSyntheticIndexArgs = 0;  // index - include in metadata
+    for (unsigned i = 0; i < totalArgs; ++i) {
+      Type argType = argTypes[i];
+      if (argType.isa<LLVM::LLVMPointerType>()) {
+        numSyntheticPtrArgs++;
+      } else if (argType.isa<IndexType>()) {
+        numSyntheticIndexArgs++;
       }
     }
-  } else {
-    // Fallback: assume all args except last 2 are user args
-    unsigned userArgCount = (totalArgs >= 2) ? totalArgs - 2 : totalArgs;
-    for (unsigned i = 0; i < userArgCount; ++i) {
-      userArgIndices.push_back(i);
+    llvm::outs() << "  Synthetic args: " << numSyntheticPtrArgs << " ptr (skip), "
+                 << numSyntheticIndexArgs << " index (include)\n";
+
+    // Only skip ptr-type synthetic args (captured globals)
+    // Index args need to be included for proper buffer allocation
+    unsigned effectiveTotalArgs = (totalArgs > numSyntheticPtrArgs) ? (totalArgs - numSyntheticPtrArgs) : totalArgs;
+
+    // Use kernel_arg_mapping attribute to identify user args
+    // The mapping tells us which host wrapper arg each kernel arg came from.
+    // Host wrapper signature is: (user_arg0, user_arg1, ..., __blocks, __threads)
+    // The last 2 host args are grid/block dimensions, NOT user args.
+    SmallVector<unsigned> userArgIndices;
+
+    // Track which args are index-type (synthetic loop bounds)
+    SmallVector<bool, 8> isIndexArg(totalArgs, false);
+    for (unsigned i = 0; i < totalArgs; ++i) {
+      if (argTypes[i].isa<IndexType>()) {
+        isIndexArg[i] = true;
+      }
     }
-  }
 
-  unsigned offset = 0;
+    if (auto mappingAttr = funcOp->getAttrOfType<DenseI64ArrayAttr>("kernel_arg_mapping")) {
+      auto mapping = mappingAttr.asArrayRef();
 
-  for (unsigned i = 0; i < userArgIndices.size(); ++i) {
-    unsigned argIndex = userArgIndices[i];
-    Type argType = argTypes[argIndex];
+      // Find the maximum host arg index to determine dim arg boundary
+      int64_t maxHostIdx = -1;
+      for (int64_t idx : mapping) {
+        if (idx > maxHostIdx) maxHostIdx = idx;
+      }
 
-    KernelArgInfo argInfo;
-    argInfo.name = "arg" + std::to_string(i);  // Renumber from 0
-    argInfo.type = getMetadataTypeString(argType);
-    argInfo.size = getTypeSizeRV32(argType);
-    argInfo.offset = offset;
-    argInfo.isPointer = argType.isa<MemRefType>() ||
-                        argType.isa<LLVM::LLVMPointerType>();
+      // If all mappings are -1, tracing completely failed
+      if (maxHostIdx < 0) {
+        for (unsigned i = 0; i < effectiveTotalArgs; ++i) {
+          userArgIndices.push_back(i);
+        }
+      } else {
+        // Trust the mapping: if mapping[i] >= 0, it's a valid user arg.
+        // Don't assume grid/block dims are at the end - they may have been
+        // specialized away by Polygeist (e.g., in main_kernel with constant dims).
+        llvm::SmallSet<int64_t, 8> seenHostArgs;
+        for (unsigned i = 0; i < mapping.size() && i < effectiveTotalArgs; ++i) {
+          int64_t hostIdx = mapping[i];
+          // Include arg if it has a valid mapping (non-negative means user arg)
+          if (hostIdx >= 0) {
+            if (seenHostArgs.insert(hostIdx).second) {
+              userArgIndices.push_back(i);
+            }
+          } else if (isIndexArg[i]) {
+            // Synthetic index arg (loop bound) - include for buffer allocation
+            // The runtime will initialize this based on a heuristic
+            userArgIndices.push_back(i);
+            llvm::outs() << "  Including synthetic index arg " << i << " for buffer allocation\n";
+          }
+        }
+      }
+    } else {
+      // Fallback: assume all non-captured args are user args
+      for (unsigned i = 0; i < effectiveTotalArgs; ++i) {
+        userArgIndices.push_back(i);
+      }
+    }
 
-    meta.arguments.push_back(argInfo);
-    offset += argInfo.size;
-  }
+    unsigned offset = 0;
 
-  meta.totalArgsSize = offset;
+    for (unsigned i = 0; i < userArgIndices.size(); ++i) {
+      unsigned argIndex = userArgIndices[i];
+      Type argType = argTypes[argIndex];
+
+      KernelArgInfo argInfo;
+      argInfo.name = "arg" + std::to_string(i);  // Renumber from 0
+      argInfo.type = getMetadataTypeString(argType);
+      argInfo.size = getTypeSizeRV32(argType);
+      argInfo.offset = offset;
+      argInfo.isPointer = argType.isa<MemRefType>() ||
+                          argType.isa<LLVM::LLVMPointerType>();
+
+      meta.arguments.push_back(argInfo);
+      offset += argInfo.size;
+    }
+
+    meta.totalArgsSize = offset;
+  }  // End of fallback (else) block
 
   // Determine output directory
   SmallString<256> outDir;
@@ -972,22 +1446,10 @@ static void emitKernelMetadata(gpu::GPUFuncOp funcOp, StringRef outputDir) {
     }
   }
 
-  // Write C header file
-  {
-    SmallString<256> headerPath(outDir);
-    llvm::sys::path::append(headerPath, meta.kernelName + "_args.h");
-
-    std::error_code ec;
-    llvm::raw_fd_ostream outFile(headerPath, ec);
-    if (ec) {
-      llvm::errs() << "Error writing header file " << headerPath << ": "
-                   << ec.message() << "\n";
-    } else {
-      outFile << generateKernelArgsHeader(meta);
-      outFile.close();
-      llvm::outs() << "Wrote kernel args header: " << headerPath << "\n";
-    }
-  }
+  // NOTE: _args.h stub generation is now handled by HIPSourceTransform (clang AST pass)
+  // which generates stubs with correct argument order BEFORE Polygeist reorders them.
+  // We only generate .meta.json here for runtime metadata.
+  // The _args.h generation code has been disabled to avoid overwriting correct stubs.
 }
 
 //===----------------------------------------------------------------------===//
@@ -1036,12 +1498,12 @@ struct ConvertGPUToVortexPass
     ConversionTarget target(*context);
     target.markUnknownOpDynamicallyLegal([](Operation *) { return true; });
     target.addIllegalOp<ThreadIdOp, BlockIdOp, gpu::BlockDimOp, gpu::GridDimOp,
-                        gpu::BarrierOp>();
+                        gpu::BarrierOp, NVVM::Barrier0Op>();
 
     // Set up rewrite patterns
     RewritePatternSet patterns(context);
     patterns.add<ThreadIdOpLowering, BlockIdOpLowering, BlockDimOpLowering,
-                 GridDimOpLowering, BarrierOpLowering>(typeConverter);
+                 GridDimOpLowering, BarrierOpLowering, NVVMBarrier0OpLowering>(typeConverter);
 
     // Apply the conversion
     if (failed(applyPartialConversion(module, target, std::move(patterns)))) {
@@ -1052,6 +1514,7 @@ struct ConvertGPUToVortexPass
     // as separate greedy rewrites (these patterns don't replace ops, just annotate)
     RewritePatternSet metadataPatterns(context);
     metadataPatterns.add<LaunchFuncMetadataExtraction, PrintfOpLowering,
+                         ThreadFenceOpLowering, MathFunctionOpLowering,
                          SharedMemoryGlobalOpLowering>(context);
     if (failed(applyPatternsAndFoldGreedily(module, std::move(metadataPatterns)))) {
       signalPassFailure();
@@ -1076,6 +1539,70 @@ struct ConvertGPUToVortexPass
         signalPassFailure();
       }
     }
+
+    // Extract kernel dimension from gpu.launch_func and set as attribute on kernel
+    // This determines whether vx_spawn_threads uses 1D, 2D, or 3D dispatch
+    // Dimension is determined by checking if gridSizeY/Z are constant 1
+    //
+    // IMPORTANT: Only process launch_func ops inside main() or similar host entry points.
+    // Launch wrapper functions (like __launch_*_kernel) have dynamic grid sizes
+    // which would incorrectly set dimension=3 for 2D kernels.
+    module.walk([&](gpu::LaunchFuncOp launchOp) {
+      // Find the corresponding gpu.func
+      auto kernelSymbol = launchOp.getKernel();
+      auto gpuModule = module.lookupSymbol<gpu::GPUModuleOp>(
+          kernelSymbol.getRootReference());
+      if (!gpuModule)
+        return;
+      auto gpuFunc = gpuModule.lookupSymbol<gpu::GPUFuncOp>(
+          kernelSymbol.getLeafReference());
+      if (!gpuFunc)
+        return;  // Not found
+
+      // Skip launch_func ops in wrapper functions (those with dynamic grid sizes)
+      // Only process if the parent function is main() or has constant grid sizes
+      auto parentFunc = launchOp->getParentOfType<func::FuncOp>();
+      bool isInMain = parentFunc && parentFunc.getName() == "main";
+
+      auto isConstantOne = [](Value v) -> bool {
+        if (auto constOp = v.getDefiningOp<arith::ConstantOp>()) {
+          if (auto intAttr = constOp.getValue().dyn_cast<IntegerAttr>()) {
+            return intAttr.getInt() == 1;
+          }
+        }
+        return false;
+      };
+
+      bool gridYIsOne = isConstantOne(launchOp.getGridSizeY());
+      bool gridZIsOne = isConstantOne(launchOp.getGridSizeZ());
+      bool hasConstantGridSizes = gridYIsOne || gridZIsOne;
+
+      // Skip if not in main and doesn't have determinable grid sizes
+      // This avoids wrapper functions with dynamic grid sizes overriding correct values
+      if (!isInMain && !hasConstantGridSizes)
+        return;
+
+      // If already has dimension attribute and this is not in main, skip
+      // (prefer main's launch_func for dimension determination)
+      if (gpuFunc->hasAttr("vortex.kernel_dimension") && !isInMain)
+        return;
+
+      // Determine dimension from grid sizes
+      // 1D: gridSizeY == 1 && gridSizeZ == 1
+      // 2D: gridSizeZ == 1
+      // 3D: otherwise
+      unsigned dimension = 3;  // Default to 3D
+
+      if (gridYIsOne && gridZIsOne) {
+        dimension = 1;
+      } else if (gridZIsOne) {
+        dimension = 2;
+      }
+
+      // Set dimension attribute on the kernel function
+      auto dimAttr = IntegerAttr::get(IntegerType::get(context, 32), dimension);
+      gpuFunc->setAttr("vortex.kernel_dimension", dimAttr);
+    });
 
     // Remove gpu.launch_func operations - they were needed for Polygeist
     // to generate proper MLIR but are not needed for Vortex kernel compilation.
@@ -1117,6 +1644,25 @@ struct ConvertGPUToVortexPass
         // Don't copy GPU-specific attributes - they're not relevant for Vortex
         // Skipped attributes: gpu.kernel, gpu.known_block_size, nvvm.*, rocdl.*
         // The kernel will use Vortex runtime conventions instead
+
+        // However, DO preserve kernel_arg_mapping - it's needed by GenerateVortexMain
+        // to identify synthetic arguments that need to be computed at runtime
+        if (auto mappingAttr = gpuFunc->getAttr("kernel_arg_mapping")) {
+          funcOp->setAttr("kernel_arg_mapping", mappingAttr);
+        }
+
+        // Preserve kernel dimension (1D, 2D, 3D) for vx_spawn_threads
+        if (auto dimAttr = gpuFunc->getAttr("vortex.kernel_dimension")) {
+          funcOp->setAttr("vortex.kernel_dimension", dimAttr);
+        }
+
+        // Preserve argument attributes like vortex.synthetic_semantic
+        // These tell GenerateVortexMain what value each synthetic arg represents
+        for (unsigned i = 0; i < gpuFunc.getNumArguments(); ++i) {
+          if (auto semanticAttr = gpuFunc.getArgAttr(i, "vortex.synthetic_semantic")) {
+            funcOp.setArgAttr(i, "vortex.synthetic_semantic", semanticAttr);
+          }
+        }
 
         // Clone the function body
         IRMapping mapping;

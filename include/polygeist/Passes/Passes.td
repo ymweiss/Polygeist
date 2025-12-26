@@ -300,6 +300,76 @@ def ConvertPolygeistToLLVM : Pass<"convert-polygeist-to-llvm", "mlir::ModuleOp">
   ];
 }
 
+def SinkIndexCastsIntoGPULaunch : Pass<"sink-index-casts-into-gpu-launch"> {
+  let summary = "Sink arith.index_cast operations into gpu.launch regions";
+  let description = [{
+    This pass sinks arith.index_cast operations into gpu.launch regions to
+    reduce the number of kernel parameters. When a value is captured by a
+    gpu.launch and then index_cast'd for use in an scf.for loop bound,
+    both the original value and the cast result become separate kernel parameters.
+
+    This pass identifies such cases and sinks the index_cast into the launch
+    region, so only the original value needs to be captured.
+
+    Example:
+      Before:
+        %count = ...  // i32
+        %bound = arith.index_cast %count : i32 to index
+        gpu.launch ... {
+          scf.for %i = 0 to %bound step 1 { ... }
+        }
+
+      After:
+        %count = ...  // i32
+        gpu.launch ... {
+          %bound = arith.index_cast %count : i32 to index
+          scf.for %i = 0 to %bound step 1 { ... }
+        }
+
+    This pass should run BEFORE gpu-kernel-outlining.
+  }];
+  let constructor = "mlir::polygeist::createSinkIndexCastsIntoGPULaunchPass()";
+  let dependentDialects = [
+    "gpu::GPUDialect",
+    "arith::ArithDialect",
+  ];
+}
+
+def SinkGpuDimsIntoLaunch : Pass<"sink-gpu-dims-into-launch"> {
+  let summary = "Sink GPU dimension operations into launch regions";
+  let description = [{
+    This pass sinks gpu.block_dim and gpu.grid_dim operations (and their
+    dependent pure computations) into gpu.launch regions before kernel
+    outlining. This eliminates synthetic kernel arguments for dimension values.
+
+    Values that would become synthetic kernel arguments are instead cloned
+    into the launch body, where they become local computations using the
+    gpu.block_dim and gpu.grid_dim operations available inside the launch.
+
+    This pass should run BEFORE gpu-kernel-outlining.
+
+    Example:
+      Before:
+        %bd = gpu.block_dim x
+        %total = arith.muli %gd, %bd : index
+        gpu.launch ... {
+          // uses %total (captured as synthetic arg)
+        }
+
+      After:
+        gpu.launch ... {
+          %bd = gpu.block_dim x
+          %total = arith.muli %gd, %bd : index
+          // uses %total (local computation)
+        }
+  }];
+  let constructor = "mlir::polygeist::createSinkGpuDimsIntoLaunchPass()";
+  let dependentDialects = [
+    "gpu::GPUDialect",
+    "arith::ArithDialect",
+  ];
+}
+
 def ReorderGPUKernelArgs : Pass<"reorder-gpu-kernel-args", "ModuleOp"> {
   let summary = "Reorder GPU kernel arguments to match original HIP kernel signature";
   let description = [{
@@ -374,6 +444,39 @@ def GenerateVortexMain : Pass<"generate-vortex-main", "ModuleOp"> {
   ];
 }
 
+def SplitKernelModules : Pass<"split-kernel-modules", "ModuleOp"> {
+  let summary = "Split multi-kernel modules for separate compilation";
+  let description = [{
+    This pass supports multi-kernel HIP programs by extracting individual kernels
+    into separate modules. Each kernel gets its own .vxbin with its own main().
+
+    The pass operates in two modes:
+    1. List mode (no kernel option): Lists all kernel names to stderr
+    2. Extract mode (kernel="name"): Removes all other kernels, keeping only the specified one
+
+    Usage in compile script:
+      # First, list all kernels in the module
+      KERNELS=$(polygeist-opt input.mlir --split-kernel-modules 2>&1 | grep "^KERNEL:")
+
+      # Then extract each kernel into a separate file
+      for K in $KERNELS; do
+        polygeist-opt input.mlir --split-kernel-modules="kernel=$K" -o kernel_$K.mlir
+      done
+
+    This approach ensures each kernel gets its own main() function without requiring
+    the host to coordinate kernel IDs - the less error-prone option for multi-kernel
+    support.
+  }];
+  let constructor = "mlir::polygeist::createSplitKernelModulesPass()";
+  let dependentDialects = [
+    "LLVM::LLVMDialect",
+  ];
+  let options = [
+    Option<"kernel", "kernel", "std::string", /*default=*/"\"\"",
+           "Name of the kernel to extract (if empty, lists all kernels)">
+  ];
+}
+
 def InsertVortexDivergence : Pass<"insert-vortex-divergence", "ModuleOp"> {
   let summary = "Insert vx_split/vx_join around divergent branches for Vortex";
   let description = [{
@@ -412,6 +515,100 @@ def InsertVortexDivergence : Pass<"insert-vortex-divergence", "ModuleOp"> {
     "LLVM::LLVMDialect",
     "cf::ControlFlowDialect",
     "func::FuncDialect",
+  ];
+}
+
+def ConvertGPULaunchToHostCall : Pass<"convert-gpu-launch-to-host-call", "ModuleOp"> {
+  let summary = "Convert gpu.launch_func to host-side runtime calls";
+  let description = [{
+    This pass converts gpu.launch_func operations in HOST functions to calls
+    to the Vortex HIP runtime. This is used to compile host launch wrappers
+    as a native library that can be linked with the host application.
+
+    The pass transforms:
+      gpu.launch_func @kernel blocks in (%gx, %gy, %gz) threads in (%bx, %by, %bz)
+        args(%ptr0 : memref<?xf32>, %ptr1 : memref<?xf32>, %n : i32)
+
+    Into:
+      %addr0 = llvm.call @hip_ptr_to_device_addr(%ptr0)
+      %addr1 = llvm.call @hip_ptr_to_device_addr(%ptr1)
+      // Build Vortex args buffer: grid + block + [addr0, addr1, n]
+      llvm.call @vortex_launch_with_args("kernel", %args_buffer, %size)
+
+    This allows compiling the launch wrapper to x86_64 host code that calls
+    the HIP runtime, instead of generating C header stubs.
+
+    Note: This pass should be used for HOST compilation, not device compilation.
+    For device compilation, use --convert-gpu-to-vortex instead.
+  }];
+  let constructor = "mlir::polygeist::createConvertGPULaunchToHostCallPass()";
+  let dependentDialects = [
+    "LLVM::LLVMDialect",
+    "gpu::GPUDialect",
+    "memref::MemRefDialect",
+    "func::FuncDialect",
+  ];
+}
+
+def GenerateVortexWrappers : Pass<"generate-vortex-wrappers", "ModuleOp"> {
+  let summary = "Generate launch wrapper functions for Vortex kernels";
+  let description = [{
+    This pass runs AFTER kernel outlining and generates launch wrapper functions
+    that call gpu.launch_func with the correct argument order.
+
+    The wrappers:
+    - Accept kernel arguments in the original HIP source order
+    - Accept grid and block dimensions as additional index parameters
+    - Call gpu.launch_func to invoke the outlined kernel
+    - Are marked for host compilation (not device)
+
+    The generated wrapper function has the signature:
+      func @__vortex_launch_<kernel>(kernel_args..., gridX, gridY, gridZ, blockX, blockY, blockZ)
+
+    This pass should run:
+    - AFTER kernel outlining (so gpu.launch_func ops exist)
+    - BEFORE convert-gpu-launch-to-host-call (which lowers the wrapper to runtime calls)
+
+    Example:
+      // Input: gpu.launch_func @kernel_module::@my_kernel blocks in (...) threads in (...) args(...)
+      // Output: Additional wrapper function:
+      // func @__vortex_launch_my_kernel(..., gridX, gridY, gridZ, blockX, blockY, blockZ) {
+      //   gpu.launch_func @kernel_module::@my_kernel ...
+      //   return
+      // }
+  }];
+  let constructor = "mlir::polygeist::createGenerateVortexWrappersPass()";
+  let dependentDialects = [
+    "LLVM::LLVMDialect",
+    "gpu::GPUDialect",
+    "memref::MemRefDialect",
+    "func::FuncDialect",
+  ];
+}
+
+def StripHostOnlyFunctions : Pass<"strip-host-only-functions", "ModuleOp"> {
+  let summary = "Remove functions marked with polygeist.host_only_func attribute";
+  let description = [{
+    This pass removes host-only functions from the module before lowering to
+    device code. Functions with the polygeist.host_only_func="1" attribute
+    are erased.
+
+    This is used in conjunction with cgeist's --emit-host-functions flag, which
+    emits both host and device functions but marks host-only functions with
+    the polygeist.host_only_func attribute. This pass then strips out the
+    host-only functions before the device compilation pipeline.
+
+    Example usage:
+      cgeist input.hip --emit-host-functions ... -o gpu.mlir
+      polygeist-opt gpu.mlir --convert-gpu-to-vortex --strip-host-only-functions ...
+
+    The pass handles both func.func and llvm.func operations, so it can be
+    run before or after LLVM lowering.
+  }];
+  let constructor = "mlir::polygeist::createStripHostOnlyFunctionsPass()";
+  let dependentDialects = [
+    "func::FuncDialect",
+    "LLVM::LLVMDialect",
   ];
 }
 

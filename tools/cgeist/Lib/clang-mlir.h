@@ -55,6 +55,7 @@ struct MLIRASTConsumer : public ASTConsumer {
   std::map<std::string, mlir::LLVM::GlobalOp> &llvmStringGlobals;
   std::map<std::string, std::pair<mlir::memref::GlobalOp, bool>> &globals;
   std::map<std::string, mlir::func::FuncOp> &functions;
+  std::map<std::string, mlir::func::FuncOp> launchWrappers;  // Cache for __polygeist_launch_* wrappers
   std::map<std::string, mlir::LLVM::GlobalOp> &llvmGlobals;
   std::map<std::string, mlir::LLVM::LLVMFuncOp> &llvmFunctions;
   Preprocessor &PP;
@@ -107,6 +108,13 @@ struct MLIRASTConsumer : public ASTConsumer {
 
   mlir::func::FuncOp GetOrCreateMLIRFunction(const FunctionDecl *FD,
                                              bool getDeviceStub = false);
+
+  /// Create or get a launch wrapper function for a CUDA/HIP kernel.
+  /// The wrapper has signature: (user_args..., gridX, gridY, gridZ, blockX, blockY, blockZ)
+  /// and contains a gpu.launch operation that calls the kernel.
+  /// This allows downstream passes to identify launch points by the __polygeist_launch_ prefix.
+  mlir::func::FuncOp getOrCreateLaunchWrapper(const FunctionDecl *kernelFD,
+                                               mlir::func::FuncOp kernelFunc);
 
   mlir::LLVM::LLVMFuncOp GetOrCreateLLVMFunction(const FunctionDecl *FD);
   mlir::LLVM::LLVMFuncOp GetOrCreateFreeFunction();

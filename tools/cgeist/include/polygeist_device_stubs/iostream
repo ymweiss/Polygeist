@@ -1,0 +1,59 @@
+/*===-- iostream - Polygeist device stub for <iostream> -------------------===*\
+|*                                                                            *|
+|* Part of the Polygeist Project, under the Apache License v2.0               *|
+|* See https://llvm.org/LICENSE.txt for license information.                  *|
+|*                                                                            *|
+|* This stub provides minimal declarations during CUDA/HIP device             *|
+|* compilation to allow host code to parse without errors.                    *|
+|*                                                                            *|
+\*===----------------------------------------------------------------------===*/
+
+#ifndef __POLYGEIST_DEVICE_STUBS_IOSTREAM
+#define __POLYGEIST_DEVICE_STUBS_IOSTREAM
+
+#ifdef __CUDA_ARCH__
+// Device compilation: provide minimal stubs that allow parsing
+// but don't actually do anything at runtime
+
+namespace std {
+  // Minimal ostream stub
+  class ostream {
+  public:
+    ostream& operator<<(const char*) { return *this; }
+    ostream& operator<<(const void*) { return *this; }
+    ostream& operator<<(int) { return *this; }
+    ostream& operator<<(unsigned int) { return *this; }
+    ostream& operator<<(long) { return *this; }
+    ostream& operator<<(unsigned long) { return *this; }
+    ostream& operator<<(long long) { return *this; }
+    ostream& operator<<(unsigned long long) { return *this; }
+    ostream& operator<<(double) { return *this; }
+    ostream& operator<<(float) { return *this; }
+    ostream& operator<<(bool) { return *this; }
+    ostream& operator<<(ostream& (*)(ostream&)) { return *this; }
+  };
+
+  // Minimal istream stub
+  class istream {
+  public:
+    istream& operator>>(int&) { return *this; }
+    istream& operator>>(double&) { return *this; }
+  };
+
+  // Global stream objects (as extern to satisfy references)
+  extern ostream cout;
+  extern ostream cerr;
+  extern ostream clog;
+  extern istream cin;
+
+  // endl manipulator
+  inline ostream& endl(ostream& os) { return os; }
+  inline ostream& flush(ostream& os) { return os; }
+}
+
+#else
+// Host compilation: include the real header
+#include_next <iostream>
+#endif
+
+#endif // __POLYGEIST_DEVICE_STUBS_IOSTREAM

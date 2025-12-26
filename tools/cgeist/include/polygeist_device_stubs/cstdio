@@ -1,0 +1,74 @@
+// Polygeist device stub for <cstdio>
+// This stub handles printf declarations for CUDA/HIP device compilation.
+
+#ifndef __POLYGEIST_DEVICE_STUBS_CSTDIO
+#define __POLYGEIST_DEVICE_STUBS_CSTDIO
+
+#ifdef __CUDA__
+// During device compilation (cgeist with --emit-cuda):
+// Provide minimal stdio declarations. printf is handled by hip_runtime.h
+// to ensure proper __device__ attribute for kernel code.
+
+#include <cstddef>  // For size_t, NULL
+#include <cstdarg>  // For va_list
+
+extern "C" {
+  // NOTE: printf is NOT declared here - it comes from hip_runtime.h
+  // with proper __device__ / __host__ attributes
+
+  int fprintf(void* stream, const char* format, ...);
+  int sprintf(char* str, const char* format, ...);
+  int snprintf(char* str, size_t size, const char* format, ...);
+  int vprintf(const char* format, va_list ap);
+  int vfprintf(void* stream, const char* format, va_list ap);
+  int vsprintf(char* str, const char* format, va_list ap);
+  int vsnprintf(char* str, size_t size, const char* format, va_list ap);
+
+  int scanf(const char* format, ...);
+  int sscanf(const char* str, const char* format, ...);
+
+  int putchar(int c);
+  int puts(const char* s);
+  int getchar(void);
+  char* gets(char* s);
+
+  void* fopen(const char* filename, const char* mode);
+  int fclose(void* stream);
+  size_t fread(void* ptr, size_t size, size_t nmemb, void* stream);
+  size_t fwrite(const void* ptr, size_t size, size_t nmemb, void* stream);
+  int fflush(void* stream);
+  int fseek(void* stream, long offset, int whence);
+  long ftell(void* stream);
+
+  extern void* stdin;
+  extern void* stdout;
+  extern void* stderr;
+}
+
+namespace std {
+  // printf is accessed via hip_runtime.h declaration
+  using ::fprintf;
+  using ::sprintf;
+  using ::snprintf;
+  using ::vprintf;
+  using ::vfprintf;
+  using ::vsprintf;
+  using ::vsnprintf;
+  using ::scanf;
+  using ::sscanf;
+  using ::putchar;
+  using ::puts;
+  using ::getchar;
+  using ::fopen;
+  using ::fclose;
+  using ::fread;
+  using ::fwrite;
+  using ::fflush;
+}
+
+#else
+// Pure host compilation (not cgeist): include the real header
+#include_next <cstdio>
+#endif
+
+#endif // __POLYGEIST_DEVICE_STUBS_CSTDIO

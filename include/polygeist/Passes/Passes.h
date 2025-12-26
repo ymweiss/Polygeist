@@ -79,10 +79,16 @@ createGpuSerializeToHsacoPass(StringRef arch, StringRef features,
 void registerGpuSerializeToCubinPass();
 void registerGpuSerializeToHsacoPass();
 
+std::unique_ptr<Pass> createSinkIndexCastsIntoGPULaunchPass();
+std::unique_ptr<Pass> createSinkGpuDimsIntoLaunchPass();
 std::unique_ptr<Pass> createReorderGPUKernelArgsPass();
 std::unique_ptr<Pass> createConvertGPUToVortexPass();
 std::unique_ptr<Pass> createGenerateVortexMainPass();
+std::unique_ptr<Pass> createSplitKernelModulesPass();
 std::unique_ptr<Pass> createInsertVortexDivergencePass();
+std::unique_ptr<Pass> createConvertGPULaunchToHostCallPass();
+std::unique_ptr<Pass> createGenerateVortexWrappersPass();
+std::unique_ptr<Pass> createStripHostOnlyFunctionsPass();
 
 void populateForBreakToWhilePatterns(RewritePatternSet &patterns);
 } // namespace polygeist

@@ -8,6 +8,8 @@
 
 #include "clang-mlir.h"
 #include "../ArgumentList.h"
+#include "HIPKernelAnalysis.h"
+#include "HIPSourceTransform.h"
 #include "TypeUtils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/DLTI/DLTI.h"
@@ -66,6 +68,38 @@ cl::opt<bool> CStyleMemRef("c-style-memref", cl::init(true),
 static cl::opt<bool>
     CombinedStructABI("struct-abi", cl::init(true),
                       cl::desc("Use literal LLVM ABI for structs"));
+
+static cl::opt<bool>
+    DumpHIPKernels("dump-hip-kernels", cl::init(false),
+                   cl::desc("Dump discovered HIP/CUDA kernels and device functions"));
+
+static cl::opt<bool>
+    EmitVortexWrappers("emit-vortex-wrappers", cl::init(false),
+                       cl::desc("Auto-generate __polygeist_launch_* wrappers for all kernels"));
+
+static cl::opt<bool>
+    EmitHostFunctions("emit-host-functions", cl::init(false),
+                      cl::desc("Also emit host-only functions (like main) in CUDA device mode"));
+
+static cl::opt<int>
+    VortexThreadsPerWarp("vortex-threads-per-warp", cl::init(0),
+                         cl::desc("Override warpSize with Vortex threads per warp (0 = use NVVM op)"));
+
+static cl::opt<bool>
+    TransformHIPSource("transform-hip-source", cl::init(false),
+                       cl::desc("Transform HIP source to add launch wrapper functions"));
+
+static cl::opt<std::string>
+    TransformOutput("transform-output", cl::init(""),
+                    cl::desc("Output file for transformed HIP source (requires --transform-hip-source)"));
+
+static cl::opt<bool>
+    TransformOnly("transform-only", cl::init(false),
+                  cl::desc("Only perform HIP source transformation, then exit"));
+
+static cl::opt<std::string>
+    StubOutputDir("stub-output-dir", cl::init(""),
+                  cl::desc("Output directory for generated _args.h stub headers"));
 
 ValueCategory MLIRScanner::createComplexFloat(mlir::Location loc,
                                               mlir::Value real,
@@ -283,11 +317,17 @@ void MLIRScanner::init(mlir::func::FuncOp function, const FunctionDecl *fd) {
   auto loc = getMLIRLocation(fd->getBeginLoc());
   if (fd->hasAttr<CUDAGlobalAttr>() && Glob.CGM.getLangOpts().CUDA &&
       !Glob.CGM.getLangOpts().CUDAIsDevice) {
-    auto deviceStub =
-        Glob.GetOrCreateMLIRFunction(fd, /* getDeviceStub */ true);
-    builder.create<func::CallOp>(loc, deviceStub, function.getArguments());
-    builder.create<func::ReturnOp>(loc);
-    return;
+    // When emit-vortex-wrappers is set, we want to emit the kernel body
+    // inside a gpu.launch region. Skip the normal stub approach.
+    if (!EmitVortexWrappers) {
+      auto deviceStub =
+          Glob.GetOrCreateMLIRFunction(fd, /* getDeviceStub */ true);
+      builder.create<func::CallOp>(loc, deviceStub, function.getArguments());
+      builder.create<func::ReturnOp>(loc);
+      return;
+    }
+    // Otherwise fall through to emit the kernel body as GPU code
+    // The kernel body will be emitted in the wrapper created by HandleTranslationUnit
   }
 
   if (auto CC = dyn_cast<CXXConstructorDecl>(fd)) {
@@ -393,10 +433,20 @@ void MLIRScanner::init(mlir::func::FuncOp function, const FunctionDecl *fd) {
   auto i1Ty = builder.getIntegerType(1);
   auto type = mlir::MemRefType::get({}, i1Ty, {}, 0);
   auto truev = builder.create<ConstantIntOp>(loc, true, 1);
-  loops.push_back({builder.create<mlir::memref::AllocaOp>(loc, type),
-                   builder.create<mlir::memref::AllocaOp>(loc, type)});
-  builder.create<mlir::memref::StoreOp>(loc, truev, loops.back().noBreak);
-  builder.create<mlir::memref::StoreOp>(loc, truev, loops.back().keepRunning);
+
+  // Skip loop context for kernel launch wrapper functions.
+  // These simple functions only contain a kernel call and don't need
+  // break/continue/return handling. Creating loop context causes IfScope
+  // to wrap statements in scf.execute_region, which gets optimized away
+  // and loses the gpu.launch operation inside.
+  bool isLaunchWrapper = function.getName().starts_with("_Z") &&
+                         function.getName().contains("__launch_");
+  if (!isLaunchWrapper) {
+    loops.push_back({builder.create<mlir::memref::AllocaOp>(loc, type),
+                     builder.create<mlir::memref::AllocaOp>(loc, type)});
+    builder.create<mlir::memref::StoreOp>(loc, truev, loops.back().noBreak);
+    builder.create<mlir::memref::StoreOp>(loc, truev, loops.back().keepRunning);
+  }
   if (function.getFunctionType().getResults().size()) {
     auto type = mlir::MemRefType::get(
         {}, function.getFunctionType().getResult(0), {}, 0);
@@ -1869,6 +1919,24 @@ std::pair<ValueCategory, bool>
 MLIRScanner::EmitGPUCallExpr(clang::CallExpr *expr) {
   auto loc = getMLIRLocation(expr->getExprLoc());
   if (auto ic = dyn_cast<ImplicitCastExpr>(expr->getCallee())) {
+    // Debug: Check for GPU builtin member calls
+    if (auto ME = dyn_cast<MemberExpr>(ic->getSubExpr())) {
+      auto memberName = ME->getMemberDecl()->getName();
+      if (memberName.starts_with("__fetch_builtin")) {
+        llvm::errs() << "[EmitGPUCallExpr] Found __fetch_builtin member: " << memberName << "\n";
+        if (auto sr2 = dyn_cast<OpaqueValueExpr>(ME->getBase())) {
+          if (auto sr = dyn_cast<DeclRefExpr>(sr2->getSourceExpr())) {
+            llvm::errs() << "[EmitGPUCallExpr] Base is: " << sr->getDecl()->getName() << "\n";
+          } else {
+            llvm::errs() << "[EmitGPUCallExpr] OpaqueValue source is not DeclRefExpr\n";
+            sr2->getSourceExpr()->dump();
+          }
+        } else {
+          llvm::errs() << "[EmitGPUCallExpr] Base is not OpaqueValueExpr: ";
+          ME->getBase()->dump();
+        }
+      }
+    }
     if (auto sr = dyn_cast<DeclRefExpr>(ic->getSubExpr())) {
       if (sr->getDecl()->getIdentifier() &&
           sr->getDecl()->getName() == "__syncthreads") {
@@ -2006,14 +2074,21 @@ MLIRScanner::EmitGPUCallExpr(clang::CallExpr *expr) {
               loc, mlir::IndexType::get(builder.getContext()), str));
     };
 
+    llvm::errs() << "[EmitGPUCallExpr] Checking for MemberExpr at line 2067\n";
     if (auto ME = dyn_cast<MemberExpr>(ic->getSubExpr())) {
       auto memberName = ME->getMemberDecl()->getName();
+      llvm::errs() << "[EmitGPUCallExpr] Found MemberExpr, member: " << memberName << "\n";
 
       if (auto sr2 = dyn_cast<OpaqueValueExpr>(ME->getBase())) {
         if (auto sr = dyn_cast<DeclRefExpr>(sr2->getSourceExpr())) {
+          llvm::errs() << "[EmitGPUCallExpr] Found DeclRefExpr base: " << sr->getDecl()->getName() << "\n";
           if (sr->getDecl()->getName() == "blockIdx") {
+            llvm::errs() << "[EmitGPUCallExpr] Creating BlockIdOp for blockIdx." << memberName
+                         << " in function: " << (EmittingFunctionDecl ? EmittingFunctionDecl->getNameAsString() : "unknown") << "\n";
             auto mlirType = getMLIRType(expr->getType());
             if (memberName == "__fetch_builtin_x") {
+              llvm::errs() << "[EmitGPUCallExpr] Returning BlockIdOp for x! Function: "
+                           << (EmittingFunctionDecl ? EmittingFunctionDecl->getNameAsString() : "unknown") << "\n";
               return make_pair(
                   ValueCategory(createBlockIdOp(gpu::Dimension::x, mlirType),
                                 /*isReference*/ false),
@@ -2054,8 +2129,12 @@ MLIRScanner::EmitGPUCallExpr(clang::CallExpr *expr) {
             }
           }
           if (sr->getDecl()->getName() == "threadIdx") {
+            llvm::errs() << "[EmitGPUCallExpr] Creating ThreadIdOp for threadIdx." << memberName
+                         << " in function: " << (EmittingFunctionDecl ? EmittingFunctionDecl->getNameAsString() : "unknown") << "\n";
             auto mlirType = getMLIRType(expr->getType());
             if (memberName == "__fetch_builtin_x") {
+              llvm::errs() << "[EmitGPUCallExpr] Returning ThreadIdOp for x! Function: "
+                           << (EmittingFunctionDecl ? EmittingFunctionDecl->getNameAsString() : "unknown") << "\n";
               return make_pair(
                   ValueCategory(createThreadIdOp(gpu::Dimension::x, mlirType),
                                 /*isReference*/ false),
@@ -3533,6 +3612,13 @@ ValueCategory MLIRScanner::VisitMemberExpr(MemberExpr *ME) {
   auto memberName = ME->getMemberDecl()->getName();
   if (auto sr2 = dyn_cast<OpaqueValueExpr>(ME->getBase())) {
     if (auto sr = dyn_cast<DeclRefExpr>(sr2->getSourceExpr())) {
+      llvm::StringRef baseName = sr->getDecl()->getName();
+      if (baseName == "blockIdx" || baseName == "threadIdx" ||
+          baseName == "blockDim" || baseName == "gridDim") {
+        llvm::errs() << "[VisitMemberExpr] GPU builtin detected: " << baseName
+                     << ", member: " << memberName << "\n";
+        ME->dump();
+      }
       if (sr->getDecl()->getName() == "blockIdx") {
         if (memberName == "__fetch_builtin_x") {
         }
@@ -4091,6 +4177,13 @@ ValueCategory MLIRScanner::VisitCastExpr(CastExpr *E) {
       if (dr->getDecl()->getIdentifier() &&
           dr->getDecl()->getName() == "warpSize") {
         auto mlirType = getMLIRType(E->getType());
+        // For Vortex, use configurable threads per warp instead of NVVM op
+        if (VortexThreadsPerWarp > 0) {
+          return ValueCategory(
+              builder.create<arith::ConstantIntOp>(loc, VortexThreadsPerWarp,
+                                                   mlirType.cast<mlir::IntegerType>().getWidth()),
+              /*isReference*/ false);
+        }
         return ValueCategory(
             builder.create<mlir::NVVM::WarpSizeOp>(loc, mlirType),
             /*isReference*/ false);
@@ -5096,6 +5189,16 @@ MLIRASTConsumer::GetOrCreateMLIRFunction(const FunctionDecl *FD,
       function->setAttrs(attrs.getDictionary(builder.getContext()));
       functionsToEmit.push_back(Def);
     }
+    // Mark host-only functions when in device mode (early exit path)
+    if (EmitHostFunctions && CGM.getLangOpts().CUDAIsDevice) {
+      bool hasDeviceAttr = FD->hasAttr<CUDADeviceAttr>() ||
+                          FD->hasAttr<CUDAGlobalAttr>();
+      if (!hasDeviceAttr && !function->hasAttr("polygeist.host_only_func")) {
+        mlir::OpBuilder builder(module->getContext());
+        function->setAttr("polygeist.host_only_func",
+                          StringAttr::get(builder.getContext(), "1"));
+      }
+    }
     assert(function->getParentOp() == module.get());
     return function;
   }
@@ -5190,6 +5293,61 @@ MLIRASTConsumer::GetOrCreateMLIRFunction(const FunctionDecl *FD,
                       StringAttr::get(builder.getContext(), "1"));
   }
 
+  // Mark host-only functions when --emit-host-functions is used
+  // A function is host-only if it doesn't have __device__ or __global__ attributes
+  if (EmitHostFunctions && CGM.getLangOpts().CUDAIsDevice) {
+    bool hasDeviceAttr = FD->hasAttr<CUDADeviceAttr>() ||
+                        FD->hasAttr<CUDAGlobalAttr>();
+    if (!hasDeviceAttr) {
+      function->setAttr("polygeist.host_only_func",
+                        StringAttr::get(builder.getContext(), "1"));
+    }
+  }
+
+  // Add kernel argument metadata for __global__ functions
+  if (FD->hasAttr<CUDAGlobalAttr>()) {
+    llvm::SmallVector<mlir::Attribute, 8> argAttrs;
+    unsigned offset = 0;
+
+    for (const clang::ParmVarDecl *param : FD->parameters()) {
+      clang::QualType paramType = param->getType();
+      clang::CharUnits size = astContext.getTypeSizeInChars(paramType);
+      clang::CharUnits align = astContext.getTypeAlignInChars(paramType);
+
+      // Compute aligned offset
+      unsigned alignVal = static_cast<unsigned>(align.getQuantity());
+      unsigned sizeVal = static_cast<unsigned>(size.getQuantity());
+      if (alignVal > 0) {
+        unsigned misalign = offset % alignVal;
+        if (misalign > 0)
+          offset += (alignVal - misalign);
+      }
+
+      bool isPtr = paramType->isPointerType() || paramType->isReferenceType() ||
+                   paramType->isArrayType();
+
+      llvm::SmallVector<mlir::NamedAttribute, 6> argDict;
+      argDict.push_back(builder.getNamedAttr(
+          "name", builder.getStringAttr(param->getNameAsString())));
+      argDict.push_back(builder.getNamedAttr(
+          "type", builder.getStringAttr(paramType.getAsString())));
+      argDict.push_back(builder.getNamedAttr(
+          "size", builder.getI32IntegerAttr(sizeVal)));
+      argDict.push_back(builder.getNamedAttr(
+          "align", builder.getI32IntegerAttr(alignVal)));
+      argDict.push_back(builder.getNamedAttr(
+          "offset", builder.getI32IntegerAttr(offset)));
+      argDict.push_back(builder.getNamedAttr(
+          "is_pointer", builder.getBoolAttr(isPtr)));
+
+      argAttrs.push_back(builder.getDictionaryAttr(argDict));
+      offset += sizeVal;
+    }
+
+    function->setAttr("vortex.kernel_args", builder.getArrayAttr(argAttrs));
+    function->setAttr("vortex.kernel_args_size", builder.getI32IntegerAttr(offset));
+  }
+
   if (LV == llvm::GlobalValue::InternalLinkage ||
       LV == llvm::GlobalValue::PrivateLinkage || !FD->isDefined() ||
       FD->hasAttr<CUDAGlobalAttr>() || FD->hasAttr<CUDADeviceAttr>()) {
@@ -5218,6 +5376,134 @@ MLIRASTConsumer::GetOrCreateMLIRFunction(const FunctionDecl *FD,
   }
   assert(function->getParentOp() == module.get());
   return function;
+}
+
+mlir::func::FuncOp
+MLIRASTConsumer::getOrCreateLaunchWrapper(const FunctionDecl *kernelFD,
+                                           mlir::func::FuncOp kernelFunc) {
+  // Get the mangled kernel name (for wrapper function naming)
+  std::string kernelMangledName =
+      CGM.getMangledName(GlobalDecl(kernelFD, KernelReferenceKind::Kernel)).str();
+  std::string wrapperName = "__polygeist_launch_" + kernelMangledName;
+
+  // Get the unmangled kernel name (for binary naming - must match what hipLaunchKernelGGL macro sees)
+  std::string kernelName = kernelFD->getNameAsString();
+
+  // Check if wrapper already exists (in cache or in functions map)
+  auto it = launchWrappers.find(wrapperName);
+  if (it != launchWrappers.end()) {
+    return it->second;
+  }
+
+  // Also check functions map (wrapper may have been created from source)
+  auto funcIt = functions.find(wrapperName);
+  if (funcIt != functions.end()) {
+    launchWrappers[wrapperName] = funcIt->second;
+    return funcIt->second;
+  }
+
+  // Check if symbol already exists in module (could be from other processing)
+  if (auto existingOp = mlir::SymbolTable::lookupSymbolIn(module.get(), wrapperName)) {
+    if (auto existingFunc = dyn_cast<mlir::func::FuncOp>(existingOp)) {
+      launchWrappers[wrapperName] = existingFunc;
+      return existingFunc;
+    }
+  }
+
+  mlir::OpBuilder builder(module->getContext());
+  auto loc = getMLIRLocation(kernelFD->getLocation());
+
+  // Build wrapper function type:
+  // (user_args..., gridX, gridY, gridZ, blockX, blockY, blockZ) -> void
+  SmallVector<mlir::Type, 16> wrapperArgTypes;
+
+  // Copy user argument types from kernel function
+  for (auto argType : kernelFunc.getArgumentTypes()) {
+    wrapperArgTypes.push_back(argType);
+  }
+
+  // Add 6 index types for grid and block dimensions
+  auto indexType = builder.getIndexType();
+  for (int i = 0; i < 6; ++i) {
+    wrapperArgTypes.push_back(indexType);
+  }
+
+  auto wrapperFuncType =
+      builder.getFunctionType(wrapperArgTypes, /*results=*/{});
+
+  // Create the wrapper function
+  auto wrapperFunc = mlir::func::FuncOp::create(loc, wrapperName, wrapperFuncType);
+
+  // Copy vortex.kernel_args attribute from kernel to wrapper
+  if (auto kernelArgsAttr = kernelFunc->getAttr("vortex.kernel_args")) {
+    wrapperFunc->setAttr("vortex.kernel_args", kernelArgsAttr);
+  }
+  if (auto kernelArgsSizeAttr = kernelFunc->getAttr("vortex.kernel_args_size")) {
+    wrapperFunc->setAttr("vortex.kernel_args_size", kernelArgsSizeAttr);
+  }
+
+  // Set linkage and visibility
+  SymbolTable::setSymbolVisibility(wrapperFunc, SymbolTable::Visibility::Private);
+  NamedAttrList attrs(wrapperFunc->getAttrDictionary());
+  attrs.set("llvm.linkage",
+            mlir::LLVM::LinkageAttr::get(builder.getContext(),
+                                          mlir::LLVM::Linkage::Internal));
+  wrapperFunc->setAttrs(attrs.getDictionary(builder.getContext()));
+
+  // Create entry block with arguments
+  auto *entryBlock = wrapperFunc.addEntryBlock();
+  builder.setInsertionPointToStart(entryBlock);
+
+  // Get wrapper arguments
+  unsigned numUserArgs = kernelFunc.getNumArguments();
+  auto wrapperArgs = entryBlock->getArguments();
+
+  // User args are the first numUserArgs arguments
+  SmallVector<mlir::Value, 8> userArgs;
+  for (unsigned i = 0; i < numUserArgs; ++i) {
+    userArgs.push_back(wrapperArgs[i]);
+  }
+
+  // Grid and block dimensions are the last 6 arguments
+  mlir::Value gridX = wrapperArgs[numUserArgs + 0];
+  mlir::Value gridY = wrapperArgs[numUserArgs + 1];
+  mlir::Value gridZ = wrapperArgs[numUserArgs + 2];
+  mlir::Value blockX = wrapperArgs[numUserArgs + 3];
+  mlir::Value blockY = wrapperArgs[numUserArgs + 4];
+  mlir::Value blockZ = wrapperArgs[numUserArgs + 5];
+
+  // Create gpu.launch operation
+  auto launchOp = builder.create<mlir::gpu::LaunchOp>(
+      loc, gridX, gridY, gridZ, blockX, blockY, blockZ,
+      /*dynamicSharedMemorySize=*/nullptr,
+      /*tokenType=*/nullptr,
+      /*asyncDependencies=*/ValueRange{});
+
+  // Copy vortex metadata to the gpu.launch operation so it gets copied
+  // to the outlined gpu.func by the kernel outlining pass
+  if (auto kernelArgsAttr = kernelFunc->getAttr("vortex.kernel_args")) {
+    launchOp->setAttr("vortex.kernel_args", kernelArgsAttr);
+  }
+  if (auto kernelArgsSizeAttr = kernelFunc->getAttr("vortex.kernel_args_size")) {
+    launchOp->setAttr("vortex.kernel_args_size", kernelArgsSizeAttr);
+  }
+  // Also store the kernel name for reference
+  launchOp->setAttr("vortex.kernel_name", builder.getStringAttr(kernelName));
+
+  // Inside the launch region, call the kernel function
+  builder.setInsertionPointToStart(&launchOp.getRegion().front());
+  builder.create<mlir::func::CallOp>(loc, kernelFunc, userArgs);
+  builder.create<mlir::gpu::TerminatorOp>(loc);
+
+  // Add return to wrapper function
+  builder.setInsertionPointToEnd(entryBlock);
+  builder.create<mlir::func::ReturnOp>(loc);
+
+  // Add wrapper to module and cache
+  module->push_back(wrapperFunc);
+  launchWrappers[wrapperName] = wrapperFunc;
+
+  return wrapperFunc;
 }
 
 void MLIRASTConsumer::run() {
@@ -5278,14 +5564,31 @@ void MLIRASTConsumer::HandleDeclContext(DeclContext *DC) {
     }
 
     bool externLinkage = true;
+    bool isHostOnlyFunc = false;
     /*
     auto LV = CGM.getFunctionLinkage(fd);
     if (LV == llvm::GlobalValue::InternalLinkage || LV ==
     llvm::GlobalValue::PrivateLinkage) externLinkage = false; if
     (fd->isInlineSpecified()) externLinkage = false;
     */
-    if (!CGM.getContext().DeclMustBeEmitted(fd))
-      externLinkage = false;
+    if (!CGM.getContext().DeclMustBeEmitted(fd)) {
+      // In CUDA device mode, DeclMustBeEmitted returns false for host-only
+      // functions. If --emit-host-functions is set, we still want to emit them.
+      if (EmitHostFunctions && CGM.getLangOpts().CUDAIsDevice) {
+        // Check if this is a host-only function (no __device__ or __global__)
+        bool hasDeviceAttr = fd->hasAttr<CUDADeviceAttr>() ||
+                            fd->hasAttr<CUDAGlobalAttr>();
+        if (!hasDeviceAttr) {
+          // This is a host-only function - mark it for emission
+          isHostOnlyFunc = true;
+          // Keep externLinkage true so it gets emitted
+        } else {
+          externLinkage = false;
+        }
+      } else {
+        externLinkage = false;
+      }
+    }
 
     std::string name;
     if (auto CC = dyn_cast<CXXConstructorDecl>(fd))
@@ -5353,14 +5656,32 @@ bool MLIRASTConsumer::HandleTopLevelDecl(DeclGroupRef dg) {
     }
 
     bool externLinkage = true;
+    bool isHostOnlyFunc = false;
+    bool isCUDADevice = CGM.getLangOpts().CUDAIsDevice;
     /*
     auto LV = CGM.getFunctionLinkage(fd);
     if (LV == llvm::GlobalValue::InternalLinkage || LV ==
     llvm::GlobalValue::PrivateLinkage) externLinkage = false; if
     (fd->isInlineSpecified()) externLinkage = false;
     */
-    if (!CGM.getContext().DeclMustBeEmitted(fd))
-      externLinkage = false;
+    if (!CGM.getContext().DeclMustBeEmitted(fd)) {
+      // In CUDA device mode, DeclMustBeEmitted returns false for host-only
+      // functions. If --emit-host-functions is set, we still want to emit them.
+      if (EmitHostFunctions && isCUDADevice) {
+        // Check if this is a host-only function (no __device__ or __global__)
+        bool hasDeviceAttr = fd->hasAttr<CUDADeviceAttr>() ||
+                            fd->hasAttr<CUDAGlobalAttr>();
+        if (!hasDeviceAttr) {
+          // This is a host-only function - mark it for emission
+          isHostOnlyFunc = true;
+          // Keep externLinkage true so it gets emitted
+        } else {
+          externLinkage = false;
+        }
+      } else {
+        externLinkage = false;
+      }
+    }
 
     std::string name;
     if (auto CC = dyn_cast<CXXConstructorDecl>(fd))
@@ -5388,6 +5709,23 @@ bool MLIRASTConsumer::HandleTopLevelDecl(DeclGroupRef dg) {
          externLinkage) ||
         emitIfFound.count(name)) {
       functionsToEmit.push_back(fd);
+      // Mark host-only functions with attribute when in device mode
+      if (EmitHostFunctions && isCUDADevice) {
+        bool hasDeviceAttr = fd->hasAttr<CUDADeviceAttr>() ||
+                            fd->hasAttr<CUDAGlobalAttr>();
+        if (!hasDeviceAttr) {
+          // Look up the existing function and mark it
+          auto it = functions.find(name);
+          if (it != functions.end()) {
+            auto function = it->second;
+            if (!function->hasAttr("polygeist.host_only_func")) {
+              mlir::OpBuilder builder(module->getContext());
+              function->setAttr("polygeist.host_only_func",
+                                StringAttr::get(builder.getContext(), "1"));
+            }
+          }
+        }
+      }
     } else {
     }
   }
@@ -5397,7 +5735,129 @@ bool MLIRASTConsumer::HandleTopLevelDecl(DeclGroupRef dg) {
 
 // Wait until Sema has instantiated all the relevant code
 // before running codegen on the selected functions.
-void MLIRASTConsumer::HandleTranslationUnit(ASTContext &C) { run(); }
+void MLIRASTConsumer::HandleTranslationUnit(ASTContext &C) {
+  // If requested, transform HIP source to add launch wrapper functions
+  // With --transform-only, this just writes the transformed source and exits
+  if (TransformHIPSource) {
+    vortex::HIPSourceTransformer transformer(C, SM, C.getLangOpts());
+    bool transformed = transformer.transform(C.getTranslationUnitDecl());
+
+    if (transformed) {
+      std::string outputPath = TransformOutput.getValue();
+      if (outputPath.empty()) {
+        // Default to a temp file if no output specified
+        outputPath = "/tmp/transformed_hip_source.cu";
+      }
+
+      if (transformer.writeToFile(outputPath)) {
+        llvm::outs() << "[HIPSourceTransform] Successfully wrote transformed source to: "
+                     << outputPath << "\n";
+
+        // Generate stub headers if output directory is specified
+        if (!StubOutputDir.getValue().empty()) {
+          if (transformer.writeStubHeader(StubOutputDir.getValue())) {
+            llvm::outs() << "[HIPSourceTransform] Generated stub headers in: "
+                         << StubOutputDir.getValue() << "\n";
+          } else {
+            llvm::errs() << "[HIPSourceTransform] Failed to generate stub headers\n";
+          }
+        }
+      } else {
+        llvm::errs() << "[HIPSourceTransform] Failed to write transformed source\n";
+      }
+    } else {
+      llvm::errs() << "[HIPSourceTransform] No transformations applied\n";
+    }
+
+    // If --transform-only is set, exit after writing transformed source
+    if (TransformOnly) {
+      llvm::outs() << "[HIPSourceTransform] --transform-only: exiting after transformation\n";
+      return;  // Skip the rest of codegen
+    }
+  }
+
+  // If requested, dump HIP/CUDA kernel information before processing
+  if (DumpHIPKernels) {
+    vortex::HIPKernelCollector collector(astContext, CGM);
+    collector.TraverseDecl(C.getTranslationUnitDecl());
+
+    llvm::outs() << "=== HIP/CUDA Kernel Analysis ===\n\n";
+
+    // Dump all kernels with full argument info
+    const auto &kernels = collector.getKernels();
+    llvm::outs() << "Kernels (" << kernels.size() << "):\n";
+    for (const auto &kernel : kernels) {
+      vortex::dumpKernelInfo(kernel, llvm::outs());
+      llvm::outs() << "\n";
+    }
+
+    // Dump all device functions
+    const auto &devFuncs = collector.getDeviceFunctions();
+    llvm::outs() << "Device Functions (" << devFuncs.size() << "):\n";
+    for (const auto &func : devFuncs) {
+      llvm::outs() << "  " << func.demangledName << " (";
+      switch (func.kind) {
+      case vortex::DeviceFunctionKind::Kernel:
+        llvm::outs() << "__global__";
+        break;
+      case vortex::DeviceFunctionKind::DeviceOnly:
+        llvm::outs() << "__device__";
+        break;
+      case vortex::DeviceFunctionKind::HostDevice:
+        llvm::outs() << "__host__ __device__";
+        break;
+      default:
+        llvm::outs() << "host";
+        break;
+      }
+      llvm::outs() << ")\n";
+      llvm::outs() << "    Mangled: " << func.mangledName << "\n";
+    }
+
+    llvm::outs() << "\n=== End Kernel Analysis ===\n";
+  }
+
+  run();
+
+  // Auto-generate launch wrappers for all kernels if requested
+  // This must happen AFTER run() so that kernel MLIR functions exist
+  // Only generate wrappers in DEVICE mode where the actual kernel function exists
+  if (EmitVortexWrappers) {
+    bool isDeviceMode = CGM.getLangOpts().CUDAIsDevice;
+
+    // Skip wrapper generation in host mode - the kernel func doesn't exist there
+    if (!isDeviceMode) {
+      llvm::errs() << "Skipping Vortex wrapper generation in host mode\n";
+    } else {
+      vortex::HIPKernelCollector collector(astContext, CGM);
+      collector.TraverseDecl(C.getTranslationUnitDecl());
+
+      const auto &kernels = collector.getKernels();
+      llvm::outs() << "Generating Vortex launch wrappers for " << kernels.size()
+                   << " kernel(s)...\n";
+
+      for (const auto &kernel : kernels) {
+        // Look up the MLIR function by regular mangled name
+        // Note: kernel.mangledName uses KernelReferenceKind::Kernel mangling, but
+        // functions are registered with regular mangling (without kernel reference kind)
+        std::string regularMangledName = CGM.getMangledName(kernel.decl).str();
+        auto it = functions.find(regularMangledName);
+        if (it == functions.end()) {
+          llvm::errs() << "Warning: MLIR function not found for kernel "
+                       << kernel.demangledName << " (mangled: "
+                       << regularMangledName << ")\n";
+          continue;
+        }
+
+        mlir::func::FuncOp kernelFunc = it->second;
+
+        // Generate the launch wrapper
+        auto wrapperFunc = getOrCreateLaunchWrapper(kernel.decl, kernelFunc);
+        llvm::outs() << "  Created wrapper: " << wrapperFunc.getName().str() << "\n";
+      }
+    } // end else (device mode)
+  }
+}
 
 mlir::Location MLIRASTConsumer::getMLIRLocation(clang::SourceLocation loc) {
   auto spellingLoc = SM.getSpellingLoc(loc);
@@ -5827,6 +6287,10 @@ mlir::Type MLIRASTConsumer::getMLIRType(clang::QualType qt, bool *implicitRef,
     if (auto IT = dyn_cast<llvm::IntegerType>(T)) {
       return builder.getIntegerType(IT->getBitWidth());
     }
+    // Handle nullptr_t and other pointer builtin types
+    if (T->isPointerTy()) {
+      return typeTranslator.translateType(T);
+    }
   }
   qt->dump();
   llvm_unreachable("unhandled type");
@@ -5919,6 +6383,42 @@ mlir::Value MLIRScanner::getTypeAlign(mlir::Location loc, clang::QualType t) {
 }
 
 #include "clang/Frontend/TextDiagnosticBuffer.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Path.h"
+
+// Extern declaration for GetExecutablePath from driver.cc
+extern std::string GetExecutablePath(const char *Argv0, bool CanonicalPrefixes);
+
+/// Get the path to polygeist_device_stubs directory for intercepting
+/// problematic STL headers during CUDA/HIP device compilation.
+static std::string getPolygeistDeviceStubsPath(const char *Argv0) {
+  void *GetExecutablePathVP = (void *)(intptr_t)GetExecutablePath;
+  std::string ExePath =
+      llvm::sys::fs::getMainExecutable(Argv0, GetExecutablePathVP);
+  llvm::SmallString<256> Path(llvm::sys::path::parent_path(ExePath));
+
+  // Try: <bin>/../include/polygeist_device_stubs (installed location)
+  llvm::sys::path::append(Path, "..", "include");
+  llvm::sys::path::append(Path, "polygeist_device_stubs");
+  if (llvm::sys::fs::exists(Path))
+    return std::string(Path);
+
+  // Try: <bin>/include/polygeist_device_stubs (build directory)
+  Path = llvm::sys::path::parent_path(ExePath);
+  llvm::sys::path::append(Path, "include", "polygeist_device_stubs");
+  if (llvm::sys::fs::exists(Path))
+    return std::string(Path);
+
+  // Try: <source>/tools/cgeist/include/polygeist_device_stubs (source tree)
+  Path = llvm::sys::path::parent_path(ExePath);
+  llvm::sys::path::append(Path, "..", "..");
+  llvm::sys::path::append(Path, "tools", "cgeist");
+  llvm::sys::path::append(Path, "include", "polygeist_device_stubs");
+  if (llvm::sys::fs::exists(Path))
+    return std::string(Path);
+
+  return "";
+}
 
 static bool parseMLIR(const char *Argv0, std::vector<std::string> filenames,
                       std::string fn, std::vector<std::string> includeDirs,
@@ -5969,6 +6469,9 @@ static bool parseMLIR(const char *Argv0, std::vector<std::string> filenames,
   if (SysRoot != "") {
     Argv.push_back("--sysroot");
     Argv.emplace_back(SysRoot);
+  }
+  if (StdLib != "") {
+    Argv.emplace_back("-stdlib=", StdLib);
   }
   if (Verbose) {
     Argv.push_back("-v");
@@ -6068,6 +6571,24 @@ static bool parseMLIR(const char *Argv0, std::vector<std::string> filenames,
     Clang->getTarget().adjust(Clang->getDiagnostics(), Clang->getLangOpts());
 
     llvm::Triple jobTriple = Clang->getTarget().getTriple();
+
+    // For GPU compilation jobs, add polygeist device stubs to intercept
+    // problematic headers (like <iostream>, <stdio.h>) that use __float128.
+    // Device code doesn't need these headers, so we provide stubs.
+    if (jobTriple.isNVPTX() || jobTriple.isAMDGCN() || jobTriple.isAMDGPU()) {
+      std::string StubPath = getPolygeistDeviceStubsPath(Argv0);
+      if (!StubPath.empty()) {
+        // Insert at beginning of UserEntries to get highest priority
+        // This ensures stubs are searched before system headers
+        // Use System (not CXXSystem) to catch both C and C++ includes
+        auto &HSOpts = Clang->getHeaderSearchOpts();
+        HSOpts.UserEntries.insert(
+            HSOpts.UserEntries.begin(),
+            clang::HeaderSearchOptions::Entry(
+                StubPath, clang::frontend::System,
+                /*IsFramework=*/false, /*IgnoreSysRoot=*/true));
+      }
+    }
     if (triple.str() == "" || !jobTriple.isNVPTX()) {
       triple = jobTriple;
       module.get()->setAttr(
