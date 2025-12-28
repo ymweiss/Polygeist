@@ -477,47 +477,6 @@ def SplitKernelModules : Pass<"split-kernel-modules", "ModuleOp"> {
   ];
 }
 
-def InsertVortexDivergence : Pass<"insert-vortex-divergence", "ModuleOp"> {
-  let summary = "Insert vx_split/vx_join around divergent branches for Vortex";
-  let description = [{
-    This pass handles SIMT divergence for the Vortex GPGPU. Unlike NVIDIA GPUs
-    which handle divergence in hardware, Vortex requires explicit vx_split()
-    and vx_join() calls around divergent branches.
-
-    The pass:
-    1. Performs divergence analysis to find values dependent on thread ID
-       (values derived from vx_get_threadIdx calls)
-    2. Identifies conditional branches with divergent conditions
-    3. Inserts vx_split_abi(condition) before each divergent branch
-    4. Inserts vx_join_abi(stack_ptr) at the convergence point (post-dominator)
-
-    This should run AFTER convert-gpu-to-vortex (which lowers gpu.thread_id to
-    vx_get_threadIdx calls) and BEFORE generate-vortex-main.
-
-    Example transformation:
-      // Before:
-      cf.cond_br %divergent_cond, ^true, ^false
-      ^true: ...
-      ^false: ...
-      ^merge: ...
-
-      // After:
-      %sp = llvm.call @vx_split_abi(%divergent_cond)
-      cf.cond_br %divergent_cond, ^true, ^false
-      ^true: ...
-      ^false: ...
-      ^merge:
-        llvm.call @vx_join_abi(%sp)
-        ...
-  }];
-  let constructor = "mlir::polygeist::createInsertVortexDivergencePass()";
-  let dependentDialects = [
-    "LLVM::LLVMDialect",
-    "cf::ControlFlowDialect",
-    "func::FuncDialect",
-  ];
-}
-
 def ConvertGPULaunchToHostCall : Pass<"convert-gpu-launch-to-host-call", "ModuleOp"> {
   let summary = "Convert gpu.launch_func to host-side runtime calls";
   let description = [{
