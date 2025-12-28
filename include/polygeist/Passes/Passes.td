@@ -411,11 +411,18 @@ def ConvertGPUToVortex : Pass<"convert-gpu-to-vortex", "ModuleOp"> {
     The pass automatically emits JSON metadata files describing kernel argument
     layouts for runtime argument marshaling. Files are written to the current
     working directory as <kernel_name>.meta.json.
+
+    The pointer-width option controls the target pointer size (32 for RV32, 64 for RV64).
+    This affects shared memory address calculations and metadata type generation.
   }];
   let constructor = "mlir::polygeist::createConvertGPUToVortexPass()";
   let dependentDialects = [
     "LLVM::LLVMDialect",
     "gpu::GPUDialect",
+  ];
+  let options = [
+    Option<"pointerWidth", "pointer-width", "unsigned", /*default=*/"32",
+           "Target pointer width in bits (32 for RV32, 64 for RV64)">
   ];
 }
 
@@ -437,10 +444,17 @@ def GenerateVortexMain : Pass<"generate-vortex-main", "ModuleOp"> {
 
     This matches the Vortex kernel execution model where kernels are launched
     via vx_spawn_threads() with a callback function.
+
+    The pointer-width option controls the target pointer size (32 for RV32, 64 for RV64).
+    This affects CSR reads, pointer loads, and argument offset calculations.
   }];
   let constructor = "mlir::polygeist::createGenerateVortexMainPass()";
   let dependentDialects = [
     "LLVM::LLVMDialect",
+  ];
+  let options = [
+    Option<"pointerWidth", "pointer-width", "unsigned", /*default=*/"32",
+           "Target pointer width in bits (32 for RV32, 64 for RV64)">
   ];
 }
 
@@ -499,6 +513,9 @@ def ConvertGPULaunchToHostCall : Pass<"convert-gpu-launch-to-host-call", "Module
 
     Note: This pass should be used for HOST compilation, not device compilation.
     For device compilation, use --convert-gpu-to-vortex instead.
+
+    The pointer-width option controls the target device pointer size (32 for RV32, 64 for RV64).
+    This affects device address types and argument buffer layout.
   }];
   let constructor = "mlir::polygeist::createConvertGPULaunchToHostCallPass()";
   let dependentDialects = [
@@ -506,6 +523,10 @@ def ConvertGPULaunchToHostCall : Pass<"convert-gpu-launch-to-host-call", "Module
     "gpu::GPUDialect",
     "memref::MemRefDialect",
     "func::FuncDialect",
+  ];
+  let options = [
+    Option<"pointerWidth", "pointer-width", "unsigned", /*default=*/"32",
+           "Target device pointer width in bits (32 for RV32, 64 for RV64)">
   ];
 }
 
