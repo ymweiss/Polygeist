@@ -85,7 +85,6 @@ std::unique_ptr<Pass> createReorderGPUKernelArgsPass();
 std::unique_ptr<Pass> createConvertGPUToVortexPass();
 std::unique_ptr<Pass> createGenerateVortexMainPass();
 std::unique_ptr<Pass> createSplitKernelModulesPass();
-std::unique_ptr<Pass> createInsertVortexDivergencePass();
 std::unique_ptr<Pass> createConvertGPULaunchToHostCallPass();
 std::unique_ptr<Pass> createGenerateVortexWrappersPass();
 std::unique_ptr<Pass> createStripHostOnlyFunctionsPass();

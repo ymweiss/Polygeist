@@ -184,9 +184,11 @@ static bool isMemrefDescriptorStart(LLVM::LLVMFunctionType funcType,
 /// LLVM lowering. Each memref<?xf32> in the original kernel becomes 5 params
 /// (ptr, ptr, i64, i64, i64) after lowering. The host passes simple device
 /// pointers, so we must construct the full descriptor from each pointer.
+///
+/// @param pointerWidth Target pointer width in bits (32 for RV32, 64 for RV64)
 static LLVM::LLVMFuncOp
 generateKernelBodyWrapper(ModuleOp module, LLVM::LLVMFuncOp kernelFunc,
-                          OpBuilder &builder) {
+                          OpBuilder &builder, unsigned pointerWidth) {
   MLIRContext *ctx = module.getContext();
   Location loc = kernelFunc.getLoc();
 
@@ -194,6 +196,10 @@ generateKernelBodyWrapper(ModuleOp module, LLVM::LLVMFuncOp kernelFunc,
   auto voidType = LLVM::LLVMVoidType::get(ctx);
   auto i32Type = IntegerType::get(ctx, 32);
   auto i64Type = IntegerType::get(ctx, 64);
+
+  // XLEN-dependent types for pointer handling
+  auto ptrIntType = IntegerType::get(ctx, pointerWidth);  // i32 for RV32, i64 for RV64
+  unsigned ptrSize = pointerWidth / 8;  // 4 bytes for RV32, 8 bytes for RV64
 
   // Create function: void kernel_body(void* args)
   auto funcType =
@@ -304,9 +310,10 @@ generateKernelBodyWrapper(ModuleOp module, LLVM::LLVMFuncOp kernelFunc,
       }
 
       // Compute offset from mapping
+      // Pointers take ptrSize bytes (4 for RV32, 8 for RV64)
       unsigned argOffset;
       if (hostIdx >= 0) {
-        argOffset = USER_ARGS_OFFSET + static_cast<unsigned>(hostIdx) * 4;
+        argOffset = USER_ARGS_OFFSET + static_cast<unsigned>(hostIdx) * ptrSize;
       } else {
         argOffset = currentOffset;  // Fallback
       }
@@ -317,8 +324,8 @@ generateKernelBodyWrapper(ModuleOp module, LLVM::LLVMFuncOp kernelFunc,
       auto argBytePtr = builder.create<LLVM::GEPOp>(loc, ptrType, i8Type,
                                                      argsPtr, gepIndices);
 
-      // Load the device pointer (4 bytes on RV32)
-      auto rawPtr = builder.create<LLVM::LoadOp>(loc, i32Type, argBytePtr);
+      // Load the device pointer (ptrSize bytes: 4 for RV32, 8 for RV64)
+      auto rawPtr = builder.create<LLVM::LoadOp>(loc, ptrIntType, argBytePtr);
       auto devicePtr = builder.create<LLVM::IntToPtrOp>(loc, ptrType, rawPtr);
 
       // Construct memref descriptor values:
@@ -339,7 +346,7 @@ generateKernelBodyWrapper(ModuleOp module, LLVM::LLVMFuncOp kernelFunc,
       unpackedArgs.push_back(maxI64);   // size = MAX (kernel has bounds check)
       unpackedArgs.push_back(oneI64);   // stride = 1
 
-      currentOffset += 4; // Single pointer in args buffer
+      currentOffset += ptrSize; // Single pointer in args buffer
       i += 5;             // Skip 5 params (the whole memref descriptor)
       origArgIdx++;       // Advance original arg index
       continue;
@@ -401,16 +408,17 @@ generateKernelBodyWrapper(ModuleOp module, LLVM::LLVMFuncOp kernelFunc,
     } else {
       // Regular user argument from user args buffer
       // Use hostIdx from kernel_arg_mapping to compute offset
-      // In RV32, all args are 4 bytes (pointers are 4 bytes, i32/f32 are 4 bytes)
-      // Exception: i64/f64 are 8 bytes
+      // Pointer args take ptrSize bytes (4 for RV32, 8 for RV64)
+      // Scalar args: i32/f32 = 4 bytes, i64/f64 = 8 bytes
       //
       // Compute offset for this host arg. Since args may have different sizes,
-      // we need to track the cumulative offset. For simplicity, assume 4 bytes
-      // per arg for now (RV32 pointers and common scalar types).
+      // we need to track the cumulative offset. For pointers, use ptrSize.
       unsigned argOffset;
       if (hostIdx >= 0) {
-        // Use mapping: offset = USER_ARGS_OFFSET + hostIdx * 4
-        argOffset = USER_ARGS_OFFSET + static_cast<unsigned>(hostIdx) * 4;
+        // Use mapping: offset = USER_ARGS_OFFSET + hostIdx * ptrSize
+        // Note: This assumes uniform arg sizes. For mixed types, the runtime
+        // must pack args according to the metadata which specifies exact sizes.
+        argOffset = USER_ARGS_OFFSET + static_cast<unsigned>(hostIdx) * ptrSize;
       } else {
         // Fallback to sequential (shouldn't happen for user args)
         argOffset = currentOffset;
@@ -422,20 +430,26 @@ generateKernelBodyWrapper(ModuleOp module, LLVM::LLVMFuncOp kernelFunc,
           builder.create<LLVM::GEPOp>(loc, ptrType, i8Type, argsPtr, gepIndices);
 
       if (argType.isa<LLVM::LLVMPointerType>()) {
-        // For pointers: load as i32 (RV32 pointer), then inttoptr
-        auto rawPtr = builder.create<LLVM::LoadOp>(loc, i32Type, argBytePtr);
+        // For pointers: load as ptrIntType (i32 for RV32, i64 for RV64), then inttoptr
+        auto rawPtr = builder.create<LLVM::LoadOp>(loc, ptrIntType, argBytePtr);
         argVal = builder.create<LLVM::IntToPtrOp>(loc, ptrType, rawPtr);
-        currentOffset += 4;
+        currentOffset += ptrSize;
       } else if (argType.isInteger(32)) {
         argVal = builder.create<LLVM::LoadOp>(loc, i32Type, argBytePtr);
         currentOffset += 4;
       } else if (argType.isInteger(64)) {
-        // On RV32, i64 args (often from Polygeist's index type conversion) are
-        // actually stored as 4-byte values in the host args buffer.
-        // Load as i32 and zero-extend to i64.
-        auto loadedVal = builder.create<LLVM::LoadOp>(loc, i32Type, argBytePtr);
-        argVal = builder.create<LLVM::ZExtOp>(loc, i64Type, loadedVal);
-        currentOffset += 4;
+        // i64 args (often from Polygeist's index type conversion) may be stored
+        // as ptrSize-byte values in the host args buffer (depends on how runtime packs).
+        // For RV32: stored as 4 bytes, load as i32 and zero-extend to i64.
+        // For RV64: stored as 8 bytes, load directly as i64.
+        if (pointerWidth == 64) {
+          argVal = builder.create<LLVM::LoadOp>(loc, i64Type, argBytePtr);
+          currentOffset += 8;
+        } else {
+          auto loadedVal = builder.create<LLVM::LoadOp>(loc, i32Type, argBytePtr);
+          argVal = builder.create<LLVM::ZExtOp>(loc, i64Type, loadedVal);
+          currentOffset += 4;
+        }
       } else if (argType.isF32()) {
         auto f32Type = Float32Type::get(ctx);
         argVal = builder.create<LLVM::LoadOp>(loc, f32Type, argBytePtr);
@@ -485,16 +499,21 @@ generateKernelBodyWrapper(ModuleOp module, LLVM::LLVMFuncOp kernelFunc,
 /// 2. Extracts grid_dim pointer from args struct
 /// 3. Calls vx_spawn_threads() with kernel_body callback
 /// @param dimension 1, 2, or 3 for grid/block dimensionality
+/// @param pointerWidth Target pointer width in bits (32 for RV32, 64 for RV64)
 static LLVM::LLVMFuncOp generateMainFunction(ModuleOp module,
                                               LLVM::LLVMFuncOp bodyFunc,
                                               LLVM::LLVMFuncOp spawnFunc,
                                               unsigned dimension,
-                                              OpBuilder &builder) {
+                                              OpBuilder &builder,
+                                              unsigned pointerWidth) {
   MLIRContext *ctx = module.getContext();
   Location loc = module.getLoc();
 
   auto i32Type = IntegerType::get(ctx, 32);
   auto ptrType = LLVM::LLVMPointerType::get(ctx);
+
+  // XLEN-dependent type for CSR read result
+  auto ptrIntType = IntegerType::get(ctx, pointerWidth);
 
   // Create function: int main()
   auto funcType =
@@ -513,9 +532,10 @@ static LLVM::LLVMFuncOp generateMainFunction(ModuleOp module,
   // 1. Read args from VX_CSR_MSCRATCH using inline assembly
   // csrr rd, 0x340
   // Note: LLVM 18+ requires direct result type, not struct-wrapped
+  // CSR read returns XLEN-width value (i32 for RV32, i64 for RV64)
   auto inlineAsm = builder.create<LLVM::InlineAsmOp>(
       loc,
-      /*resultTypes=*/i32Type,
+      /*resultTypes=*/ptrIntType,
       /*operands=*/ValueRange{},
       /*asm_string=*/"csrr $0, 0x340",
       /*constraints=*/"=r",
@@ -592,8 +612,8 @@ struct GenerateVortexMainPass
     // 3. Declare vx_spawn_threads
     auto spawnFunc = getOrDeclareVxSpawnThreads(module, builder);
 
-    // 4. Generate kernel_body wrapper
-    auto bodyFunc = generateKernelBodyWrapper(module, kernelFunc, builder);
+    // 4. Generate kernel_body wrapper (with pointerWidth for XLEN-dependent code)
+    auto bodyFunc = generateKernelBodyWrapper(module, kernelFunc, builder, pointerWidth);
 
     // 5. Read dimension from kernel function attribute (default to 1 for backward compatibility)
     // Dimension is set by ConvertGPUToVortex pass based on grid sizes
@@ -602,8 +622,8 @@ struct GenerateVortexMainPass
       dimension = dimAttr.getInt();
     }
 
-    // 6. Generate main() entry point
-    generateMainFunction(module, bodyFunc, spawnFunc, dimension, builder);
+    // 6. Generate main() entry point (with pointerWidth for XLEN-dependent CSR read)
+    generateMainFunction(module, bodyFunc, spawnFunc, dimension, builder, pointerWidth);
   }
 };
 
