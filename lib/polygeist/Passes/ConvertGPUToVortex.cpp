@@ -897,10 +897,7 @@ struct SharedMemoryGetGlobalOpLowering
     }
 
     unsigned offset = it->second.first;
-    // TODO: For RV64 support, these should use i64 type for address arithmetic.
-    // Currently hardcoded to i32 for RV32. Need to thread pointerWidth option
-    // through the ConversionPattern infrastructure.
-    auto addrType = rewriter.getI32Type();  // Use i64 for RV64
+    auto i32Type = rewriter.getI32Type();
 
     // Get pointer type with address space 3 for shared memory
     unsigned addressSpace = memrefType.getMemorySpaceAsInt();
@@ -909,12 +906,11 @@ struct SharedMemoryGetGlobalOpLowering
 
     // Generate CSR read for local memory base
     // csrr %0, 0xFC3 (VX_CSR_LOCAL_MEM_BASE)
-    // CSR read returns XLEN-width value (i32 for RV32, i64 for RV64)
     std::string csrAsmStr = "csrr $0, " + std::to_string(VX_CSR_LOCAL_MEM_BASE);
 
     auto csrRead = rewriter.create<LLVM::InlineAsmOp>(
         loc,
-        addrType,            // result type: i32 for RV32, i64 for RV64
+        i32Type,             // result type (single i32, not a struct)
         ValueRange{},        // operands
         csrAsmStr,           // asm string
         "=r",                // constraints: output to register
@@ -942,17 +938,17 @@ struct SharedMemoryGetGlobalOpLowering
     // Note: For now, we use totalSharedMemorySize computed so far.
     // A more robust approach would compute this in a second pass.
     Value totalSizeVal = rewriter.create<LLVM::ConstantOp>(
-        loc, addrType, rewriter.getI32IntegerAttr(totalSharedMemorySize));
+        loc, i32Type, rewriter.getI32IntegerAttr(totalSharedMemorySize));
     Value groupOffset = rewriter.create<LLVM::MulOp>(
-        loc, addrType, localGroupId, totalSizeVal);
+        loc, i32Type, localGroupId, totalSizeVal);
     Value baseWithGroup = rewriter.create<LLVM::AddOp>(
-        loc, addrType, baseAddr, groupOffset);
+        loc, i32Type, baseAddr, groupOffset);
 
     // Add the static offset for this specific global
     Value offsetVal = rewriter.create<LLVM::ConstantOp>(
-        loc, addrType, rewriter.getI32IntegerAttr(offset));
+        loc, i32Type, rewriter.getI32IntegerAttr(offset));
     Value finalAddr = rewriter.create<LLVM::AddOp>(
-        loc, addrType, baseWithGroup, offsetVal);
+        loc, i32Type, baseWithGroup, offsetVal);
 
     // Convert to pointer
     Value ptr = rewriter.create<LLVM::IntToPtrOp>(loc, ptrType, finalAddr);
@@ -1058,12 +1054,11 @@ static std::string getMetadataTypeString(Type type) {
   return "unknown";
 }
 
-/// Get size in bytes for a type based on pointer width (32 or 64)
-/// @param pointerWidth Target pointer width in bits (32 for RV32, 64 for RV64)
-static unsigned getTypeSize(Type type, unsigned pointerWidth = 32) {
-  // Pointer size depends on target XLEN
+/// Get size in bytes for a type on RV32
+static unsigned getTypeSizeRV32(Type type) {
+  // On RV32 Vortex, pointers are 4 bytes
   if (type.isa<MemRefType>() || type.isa<LLVM::LLVMPointerType>())
-    return pointerWidth / 8;  // 4 bytes for RV32, 8 bytes for RV64
+    return 4;
   if (type.isInteger(32) || type.isF32())
     return 4;
   if (type.isInteger(64) || type.isF64() || type.isIndex())
@@ -1072,12 +1067,8 @@ static unsigned getTypeSize(Type type, unsigned pointerWidth = 32) {
 }
 
 /// Convert metadata type string to C type
-/// @param pointerWidth Target pointer width in bits (32 for RV32, 64 for RV64)
-static std::string getCTypeString(const std::string &metaType, unsigned pointerWidth = 32) {
-  if (metaType == "ptr") {
-    // Device pointer size matches target XLEN
-    return (pointerWidth == 64) ? "uint64_t" : "uint32_t";
-  }
+static std::string getCTypeString(const std::string &metaType) {
+  if (metaType == "ptr") return "uint32_t";  // RV32 pointer = 32-bit device address
   if (metaType == "i32") return "int32_t";
   if (metaType == "u32") return "uint32_t";
   if (metaType == "i64") return "int64_t";
@@ -1418,7 +1409,7 @@ static void emitKernelMetadata(gpu::GPUFuncOp funcOp, StringRef outputDir) {
       KernelArgInfo argInfo;
       argInfo.name = "arg" + std::to_string(i);  // Renumber from 0
       argInfo.type = getMetadataTypeString(argType);
-      argInfo.size = getTypeSize(argType);  // TODO: Pass pointerWidth for RV64
+      argInfo.size = getTypeSizeRV32(argType);
       argInfo.offset = offset;
       argInfo.isPointer = argType.isa<MemRefType>() ||
                           argType.isa<LLVM::LLVMPointerType>();

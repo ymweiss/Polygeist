@@ -3,15 +3,6 @@
 // This pass converts gpu.launch_func operations to calls to the Vortex HIP
 // runtime. This allows compiling host launch wrappers as a native library.
 //
-// The argument buffer layout must match what the device expects:
-// - Header: 6 x i32 for grid/block dimensions (always 24 bytes)
-// - Args: Each argument sized according to device type:
-//   - Pointers: pointerWidth/8 bytes (4 for RV32, 8 for RV64)
-//   - i32/f32: 4 bytes
-//   - i64/f64: 8 bytes
-//   - i16: 2 bytes
-//   - i8: 1 byte
-//
 //===----------------------------------------------------------------------===//
 
 #include "polygeist/Passes/Passes.h"
@@ -31,54 +22,175 @@ using namespace mlir::polygeist;
 
 namespace {
 
-/// Get the size in bytes for a type on the device
-/// pointerWidth: 32 for RV32, 64 for RV64
-static unsigned getDeviceTypeSize(Type type, unsigned pointerWidth) {
-  // Pointer types (memref, ptr)
-  if (type.isa<MemRefType>() || type.isa<LLVM::LLVMPointerType>())
-    return pointerWidth / 8;  // 4 for RV32, 8 for RV64
+/// Pattern to convert gpu.launch_func to calls to vortex_launch_kernel_direct
+struct ConvertLaunchFuncToHostCall : public OpRewritePattern<gpu::LaunchFuncOp> {
+  using OpRewritePattern<gpu::LaunchFuncOp>::OpRewritePattern;
 
-  // Integer types
-  if (auto intType = type.dyn_cast<IntegerType>()) {
-    unsigned bits = intType.getWidth();
-    if (bits <= 8) return 1;
-    if (bits <= 16) return 2;
-    if (bits <= 32) return 4;
-    return 8;  // i64 and larger
+  LogicalResult matchAndRewrite(gpu::LaunchFuncOp launchOp,
+                                PatternRewriter &rewriter) const override {
+    Location loc = launchOp.getLoc();
+    ModuleOp module = launchOp->getParentOfType<ModuleOp>();
+
+    // Get LLVM types
+    auto i32Type = rewriter.getI32Type();
+    auto i64Type = rewriter.getI64Type();
+    auto ptrType = LLVM::LLVMPointerType::get(rewriter.getContext());
+
+    // Declare external runtime functions if not already declared
+    auto getOrInsertFunc = [&](StringRef name, Type resultType,
+                               ArrayRef<Type> argTypes) -> LLVM::LLVMFuncOp {
+      if (auto existingFunc = module.lookupSymbol<LLVM::LLVMFuncOp>(name))
+        return existingFunc;
+
+      auto funcType = LLVM::LLVMFunctionType::get(resultType, argTypes);
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(module.getBody());
+      return rewriter.create<LLVM::LLVMFuncOp>(loc, name, funcType);
+    };
+
+    // hip_ptr_to_device_addr: (ptr) -> i32
+    getOrInsertFunc("hip_ptr_to_device_addr", i32Type, {ptrType});
+
+    // vortex_launch_with_args: (ptr, ptr, i64) -> i32
+    // Args: kernel_name, vortex_args, args_size
+    getOrInsertFunc("vortex_launch_with_args", i32Type, {ptrType, ptrType, i64Type});
+
+    // Get kernel name
+    StringRef kernelName = launchOp.getKernelName().getValue();
+
+    // Create kernel name string constant
+    std::string kernelNameStr = kernelName.str();
+    kernelNameStr += ".vxbin";  // Append extension for lookup
+    kernelNameStr.push_back('\0');  // Null terminator
+
+    // Create global string for kernel name
+    std::string globalName = ("__vortex_kernel_name_" + kernelName).str();
+    LLVM::GlobalOp nameGlobal;
+    if (auto existing = module.lookupSymbol<LLVM::GlobalOp>(globalName)) {
+      nameGlobal = existing;
+    } else {
+      auto stringType = LLVM::LLVMArrayType::get(
+          IntegerType::get(rewriter.getContext(), 8), kernelNameStr.size());
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(module.getBody());
+      nameGlobal = rewriter.create<LLVM::GlobalOp>(
+          loc, stringType, /*isConstant=*/true, LLVM::Linkage::Internal,
+          globalName, rewriter.getStringAttr(kernelNameStr));
+    }
+
+    // Get pointer to kernel name
+    Value kernelNamePtr = rewriter.create<LLVM::AddressOfOp>(loc, ptrType, globalName);
+
+    // Get grid and block dimensions
+    Value gridX = launchOp.getGridSizeX();
+    Value gridY = launchOp.getGridSizeY();
+    Value gridZ = launchOp.getGridSizeZ();
+    Value blockX = launchOp.getBlockSizeX();
+    Value blockY = launchOp.getBlockSizeY();
+    Value blockZ = launchOp.getBlockSizeZ();
+
+    // Convert index types to i32 if needed
+    auto toI32 = [&](Value v) -> Value {
+      if (v.getType().isIndex()) {
+        return rewriter.create<arith::IndexCastOp>(loc, i32Type, v);
+      }
+      if (v.getType() != i32Type) {
+        return rewriter.create<LLVM::TruncOp>(loc, i32Type, v);
+      }
+      return v;
+    };
+
+    gridX = toI32(gridX);
+    gridY = toI32(gridY);
+    gridZ = toI32(gridZ);
+    blockX = toI32(blockX);
+    blockY = toI32(blockY);
+    blockZ = toI32(blockZ);
+
+    // Get kernel operands
+    auto kernelOperands = launchOp.getKernelOperands();
+    unsigned numArgs = kernelOperands.size();
+
+    // Calculate buffer size: 6 * i32 (grid + block) + numArgs * i32
+    unsigned headerSize = 6 * 4;  // 24 bytes
+    unsigned argsSize = numArgs * 4;
+    unsigned totalSize = headerSize + argsSize;
+
+    // Allocate buffer on stack
+    Value one = rewriter.create<LLVM::ConstantOp>(loc, i64Type, 1);
+    auto i8Type = rewriter.getI8Type();
+    auto bufferType = LLVM::LLVMArrayType::get(i8Type, totalSize);
+    Value buffer = rewriter.create<LLVM::AllocaOp>(loc, ptrType, bufferType, one);
+
+    // Store grid dimensions (offset 0, 4, 8)
+    auto storeI32AtOffset = [&](Value val, unsigned offset) {
+      Value offsetVal = rewriter.create<LLVM::ConstantOp>(loc, i64Type, offset);
+      Value ptr = rewriter.create<LLVM::GEPOp>(loc, ptrType, i8Type, buffer,
+                                               ValueRange{offsetVal});
+      rewriter.create<LLVM::StoreOp>(loc, val, ptr);
+    };
+
+    storeI32AtOffset(gridX, 0);
+    storeI32AtOffset(gridY, 4);
+    storeI32AtOffset(gridZ, 8);
+    storeI32AtOffset(blockX, 12);
+    storeI32AtOffset(blockY, 16);
+    storeI32AtOffset(blockZ, 20);
+
+    // Convert and store kernel arguments at offset 24+
+    unsigned argOffset = 24;
+    for (auto [idx, arg] : llvm::enumerate(kernelOperands)) {
+      Type argType = arg.getType();
+      Value argVal;
+
+      if (argType.isa<MemRefType>()) {
+        // Pointer argument - convert to device address
+        // First extract the base pointer from memref
+        Value basePtr = rewriter.create<memref::ExtractAlignedPointerAsIndexOp>(
+            loc, arg);
+        Value ptrAsInt = rewriter.create<arith::IndexCastOp>(loc, i64Type, basePtr);
+        Value ptrVal = rewriter.create<LLVM::IntToPtrOp>(loc, ptrType, ptrAsInt);
+
+        // Call hip_ptr_to_device_addr
+        argVal = rewriter.create<LLVM::CallOp>(
+            loc, i32Type, "hip_ptr_to_device_addr", ValueRange{ptrVal}).getResult();
+      } else if (argType.isInteger(32)) {
+        argVal = arg;
+      } else if (argType.isInteger(64)) {
+        // Truncate to 32-bit for device
+        argVal = rewriter.create<LLVM::TruncOp>(loc, i32Type, arg);
+      } else if (argType.isIndex()) {
+        // Index -> i32
+        argVal = rewriter.create<arith::IndexCastOp>(loc, i32Type, arg);
+      } else if (argType.isF32()) {
+        // Bitcast float to i32
+        argVal = rewriter.create<LLVM::BitcastOp>(loc, i32Type, arg);
+      } else {
+        // Fallback: try to convert via index
+        argVal = rewriter.create<arith::IndexCastOp>(loc, i32Type, arg);
+      }
+
+      storeI32AtOffset(argVal, argOffset);
+      argOffset += 4;
+    }
+
+    // Call vortex_launch_with_args
+    Value totalSizeVal = rewriter.create<LLVM::ConstantOp>(loc, i64Type, totalSize);
+    rewriter.create<LLVM::CallOp>(
+        loc, i32Type, "vortex_launch_with_args",
+        ValueRange{kernelNamePtr, buffer, totalSizeVal});
+
+    // Erase the original launch operation
+    rewriter.eraseOp(launchOp);
+
+    return success();
   }
-
-  // Floating point types
-  if (type.isF16() || type.isBF16()) return 2;
-  if (type.isF32()) return 4;
-  if (type.isF64()) return 8;
-
-  // Index type - same as pointer width
-  if (type.isIndex())
-    return pointerWidth / 8;
-
-  // Default to pointer size for unknown types
-  return pointerWidth / 8;
-}
+};
 
 /// Pass to convert gpu.launch_func to host runtime calls
-/// Supports RV32 (pointerWidth=32) and RV64 (pointerWidth=64) targets.
 struct ConvertGPULaunchToHostCallPass
     : public PassWrapper<ConvertGPULaunchToHostCallPass, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ConvertGPULaunchToHostCallPass)
-
-  ConvertGPULaunchToHostCallPass() = default;
-  ConvertGPULaunchToHostCallPass(const ConvertGPULaunchToHostCallPass &other)
-      : PassWrapper(other), pointerWidthValue(other.pointerWidthValue) {}
-  explicit ConvertGPULaunchToHostCallPass(unsigned ptrWidth)
-      : pointerWidthValue(ptrWidth) {}
-
-  // Pointer width value (32 or 64), set by command-line option
-  unsigned pointerWidthValue = 32;
-
-  // Command-line option for pointer width
-  Pass::Option<unsigned> pointerWidthOpt{*this, "pointer-width",
-      llvm::cl::desc("Target device pointer width in bits (32 for RV32, 64 for RV64)"),
-      llvm::cl::init(32)};
 
   StringRef getArgument() const override { return "convert-gpu-launch-to-host-call"; }
 
@@ -205,19 +317,11 @@ struct ConvertGPULaunchToHostCallPass
   void runOnOperation() override {
     ModuleOp module = getOperation();
 
-    // Get effective pointer width (from option or constructor)
-    unsigned ptrWidth = pointerWidthOpt.hasValue() ? pointerWidthOpt.getValue()
-                                                   : pointerWidthValue;
-
-    // Get types based on pointer width
-    auto i8Type = IntegerType::get(&getContext(), 8);
-    auto i16Type = IntegerType::get(&getContext(), 16);
+    // Get types
     auto i32Type = IntegerType::get(&getContext(), 32);
     auto i64Type = IntegerType::get(&getContext(), 64);
+    auto i8Type = IntegerType::get(&getContext(), 8);
     auto ptrType = LLVM::LLVMPointerType::get(&getContext());
-
-    // Device address type: i32 for RV32, i64 for RV64
-    Type deviceAddrType = (ptrWidth == 64) ? (Type)i64Type : (Type)i32Type;
 
     // Declare external runtime functions at the start of the module
     OpBuilder moduleBuilder(&getContext());
@@ -269,8 +373,7 @@ struct ConvertGPULaunchToHostCallPass
       goto cleanup;
     }
 
-    // hip_ptr_to_device_addr returns device address (i32 for RV32, i64 for RV64)
-    getOrInsertFunc("hip_ptr_to_device_addr", deviceAddrType, {ptrType});
+    getOrInsertFunc("hip_ptr_to_device_addr", i32Type, {ptrType});
     getOrInsertFunc("vortex_launch_with_args", i32Type, {ptrType, ptrType, i64Type});
 
     // Process each launch
@@ -333,12 +436,10 @@ struct ConvertGPULaunchToHostCallPass
       Value blockY = toI32(blockYVal);
       Value blockZ = toI32(blockZVal);
 
-      // Calculate buffer size based on actual type sizes
-      unsigned headerSize = 6 * 4;  // 24 bytes for grid+block (always i32)
-      unsigned argsSize = 0;
-      for (auto origArg : info.operands) {
-        argsSize += getDeviceTypeSize(origArg.getType(), ptrWidth);
-      }
+      // Calculate buffer size
+      unsigned numArgs = info.operands.size();
+      unsigned headerSize = 6 * 4;  // 24 bytes for grid+block
+      unsigned argsSize = numArgs * 4;
       unsigned totalSize = headerSize + argsSize;
 
       // Allocate buffer on stack
@@ -346,77 +447,51 @@ struct ConvertGPULaunchToHostCallPass
       auto bufferType = LLVM::LLVMArrayType::get(i8Type, totalSize);
       Value buffer = builder.create<LLVM::AllocaOp>(loc, ptrType, bufferType, one);
 
-      // Helper to store a value at offset
-      auto storeAtOffset = [&](Value val, unsigned offset) {
+      // Helper to store i32 at offset
+      auto storeI32AtOffset = [&](Value val, unsigned offset) {
         Value offsetVal = builder.create<LLVM::ConstantOp>(loc, i64Type, offset);
         Value ptr = builder.create<LLVM::GEPOp>(loc, ptrType, i8Type, buffer,
                                                  ValueRange{offsetVal});
         builder.create<LLVM::StoreOp>(loc, val, ptr);
       };
 
-      // Store grid and block dimensions (always i32)
-      storeAtOffset(gridX, 0);
-      storeAtOffset(gridY, 4);
-      storeAtOffset(gridZ, 8);
-      storeAtOffset(blockX, 12);
-      storeAtOffset(blockY, 16);
-      storeAtOffset(blockZ, 20);
+      // Store grid and block dimensions
+      storeI32AtOffset(gridX, 0);
+      storeI32AtOffset(gridY, 4);
+      storeI32AtOffset(gridZ, 8);
+      storeI32AtOffset(blockX, 12);
+      storeI32AtOffset(blockY, 16);
+      storeI32AtOffset(blockZ, 20);
 
-      // Convert and store kernel arguments with proper sizes
+      // Convert and store kernel arguments
       unsigned argOffset = 24;
       for (auto origArg : info.operands) {
         // Clone argument if needed
         Value arg = getOrCloneValue(origArg);
         Type argType = arg.getType();
         Value argVal;
-        unsigned argSize = getDeviceTypeSize(argType, ptrWidth);
 
         if (argType.isa<MemRefType>()) {
           // Pointer argument - convert to device address
           Value basePtr = builder.create<memref::ExtractAlignedPointerAsIndexOp>(loc, arg);
           Value ptrAsInt = builder.create<arith::IndexCastOp>(loc, i64Type, basePtr);
           Value ptrVal = builder.create<LLVM::IntToPtrOp>(loc, ptrType, ptrAsInt);
-          // hip_ptr_to_device_addr returns deviceAddrType (i32 or i64)
           argVal = builder.create<LLVM::CallOp>(
-              loc, deviceAddrType, "hip_ptr_to_device_addr", ValueRange{ptrVal}).getResult();
-        } else if (argType.isInteger(64)) {
-          // i64 - store as 8 bytes
-          argVal = arg;
+              loc, i32Type, "hip_ptr_to_device_addr", ValueRange{ptrVal}).getResult();
         } else if (argType.isInteger(32)) {
           argVal = arg;
-        } else if (argType.isInteger(16)) {
-          // i16 - store as 2 bytes
-          argVal = arg;
-        } else if (argType.isInteger(8)) {
-          // i8 - store as 1 byte
-          argVal = arg;
+        } else if (argType.isInteger(64)) {
+          argVal = builder.create<LLVM::TruncOp>(loc, i32Type, arg);
         } else if (argType.isIndex()) {
-          // Index type - convert to device address size
-          if (ptrWidth == 64) {
-            argVal = builder.create<arith::IndexCastOp>(loc, i64Type, arg);
-          } else {
-            argVal = builder.create<arith::IndexCastOp>(loc, i32Type, arg);
-          }
-        } else if (argType.isF64()) {
-          // f64 - store as 8 bytes (bitcast to i64)
-          argVal = builder.create<LLVM::BitcastOp>(loc, i64Type, arg);
+          argVal = builder.create<arith::IndexCastOp>(loc, i32Type, arg);
         } else if (argType.isF32()) {
-          // f32 - bitcast to i32
           argVal = builder.create<LLVM::BitcastOp>(loc, i32Type, arg);
-        } else if (argType.isF16() || argType.isBF16()) {
-          // f16/bf16 - bitcast to i16
-          argVal = builder.create<LLVM::BitcastOp>(loc, i16Type, arg);
         } else {
-          // Fallback: try to convert to device address size
-          if (ptrWidth == 64) {
-            argVal = builder.create<arith::IndexCastOp>(loc, i64Type, arg);
-          } else {
-            argVal = builder.create<arith::IndexCastOp>(loc, i32Type, arg);
-          }
+          argVal = builder.create<arith::IndexCastOp>(loc, i32Type, arg);
         }
 
-        storeAtOffset(argVal, argOffset);
-        argOffset += argSize;
+        storeI32AtOffset(argVal, argOffset);
+        argOffset += 4;
       }
 
       // Call vortex_launch_with_args
